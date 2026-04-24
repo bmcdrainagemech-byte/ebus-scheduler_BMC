@@ -860,15 +860,19 @@ def _even_spacing_min(config, headway_df, travel_time_df) -> dict:
         nodes = [config.start_point, config.end_point]
         nodes += [n.strip() for n in getattr(config, "intermediates", []) if n and n.strip()]
         min_tt_depot = float("inf")
+        nearest_node = None
         for node in nodes:
             try:
                 tt = config.get_travel_time(config.depot, node)
-                min_tt_depot = min(min_tt_depot, tt)
+                if tt < min_tt_depot:
+                    min_tt_depot = tt
+                    nearest_node = node
             except Exception:
                 pass
         nearest_tt = min_tt_depot if min_tt_depot < float("inf") else 30.0
     except Exception:
         nearest_tt = 30.0
+        nearest_node = None
 
     trig    = getattr(config, "trigger_soc_percent", 40)
     tgt     = getattr(config, "target_soc_percent",  90)
@@ -896,10 +900,17 @@ def _even_spacing_min(config, headway_df, travel_time_df) -> dict:
         # Use worst-case far-terminal RT for bands overlapping that window
         p5_near_end = ce_h - 1.5
         if band_h >= p5_near_end:
-            # Bus may charge from far terminal: full route time to depot
+            # Bus may charge from far terminal: full route time to depot.
+            # "Far" = the terminal that is NOT the nearest to depot.
             try:
-                far_loc = config.end_point if config.start_point == config.start_point else config.start_point
-                for term in [config.start_point, config.end_point]:
+                if nearest_node == config.start_point:
+                    far_loc = config.end_point
+                elif nearest_node == config.end_point:
+                    far_loc = config.start_point
+                else:
+                    # nearest_node is an intermediate, or unknown — try both terminals
+                    far_loc = config.end_point
+                for term in [far_loc, config.start_point, config.end_point]:
                     try:
                         full_tt = config.get_travel_time(term, config.depot)
                         return full_tt + chg_min + nearest_tt
@@ -2679,30 +2690,80 @@ elif app_mode == "🏙️ Citywide":
                 st.markdown('<div class="section-title">Headway Profile & Recommendations</div>',
                             unsafe_allow_html=True)
 
-                # Feasibility banner
+                # Feasibility banner — empirical (based on delivered schedule)
+                # Compute "could go lower" tip from actual delivered gaps.
+                _delivered_peak_p50 = None
+                _delivered_offpeak_p50 = None
+                if _rec_profile:
+                    _peak_p50s = [r.get("delivered_p50", 0) for r in _rec_profile
+                                  if r.get("is_peak") and r.get("delivered_n", 0) >= 3]
+                    _offp_p50s = [r.get("delivered_p50", 0) for r in _rec_profile
+                                  if not r.get("is_peak") and r.get("delivered_n", 0) >= 3]
+                    if _peak_p50s:
+                        _delivered_peak_p50 = min(_peak_p50s)
+                    if _offp_p50s:
+                        _delivered_offpeak_p50 = min(_offp_p50s)
+
+                # Check if configured headway could go lower (schedule is over-performing)
+                _cfg_peak    = min((r["cfg_hw"] for r in _rec_profile if r.get("is_peak")), default=None) if _rec_profile else None
+                _cfg_offpeak = max((r["cfg_hw"] for r in _rec_profile if not r.get("is_peak")), default=None) if _rec_profile else None
+                _could_lower_peak    = (_delivered_peak_p50 is not None and _cfg_peak is not None
+                                        and _delivered_peak_p50 + 2 <= _cfg_peak)
+                _could_lower_offpeak = (_delivered_offpeak_p50 is not None and _cfg_offpeak is not None
+                                        and _delivered_offpeak_p50 + 2 <= _cfg_offpeak)
+
+                # Inform planner if Resource Optimization auto-tightened headway
+                _hw_source = getattr(rr_hw, "headway_source", "user")
+                if _hw_source == "empirical_recalibrated":
+                    st.info(
+                        "⚡ **Resource Optimization auto-tightened the headway profile.** "
+                        "The scheduler measured what your fleet actually delivered on a baseline "
+                        "run, then rebuilt the schedule with tighter bands where capacity allowed. "
+                        "The 'Input (min)' column below reflects the tightened values, not your "
+                        "original config."
+                    )
+
                 if _feas_status == "INFEASIBLE":
                     st.error(
-                        f"❌ **Headway infeasible** — one or more bands are below the physics minimum. "
-                        f"Large charging gaps (80–95 min) will appear in the schedule. "
-                        f"Minimum feasible peak headway: **{_h_phys} min** · "
-                        f"Recommended: **{_rec_peak} min** peak · **{_rec_offpeak} min** off-peak."
+                        f"❌ **Headway infeasible** — one or more bands deliver median gaps "
+                        f">1.5× their configured headway. Add buses or raise those bands' headway.  \n"
+                        f"Honest physics floor (continuous, no charging): **{_h_phys} min**."
+                    )
+                elif _feas_status == "MARGINAL":
+                    st.warning(
+                        f"⚠ **Headway marginal** — configured headway is delivered on median "
+                        f"but charging transitions cause occasional spikes (>1.5× in p90). "
+                        f"This is usually acceptable; add one bus to eliminate spikes if desired."
                     )
                 elif _feas_status == "OK":
-                    st.success(
-                        f"✅ All headway bands meet the physics minimum. "
-                        f"Min feasible: {_h_phys} min · Rec peak: {_rec_peak} min · "
-                        f"Off-peak: {_rec_offpeak} min"
-                    )
+                    if _could_lower_peak or _could_lower_offpeak:
+                        _tip_parts = []
+                        if _could_lower_peak:
+                            _tip_parts.append(f"peak could go from {_cfg_peak} → ~{int(_delivered_peak_p50)} min")
+                        if _could_lower_offpeak:
+                            _tip_parts.append(f"off-peak could go from {_cfg_offpeak} → ~{int(_delivered_offpeak_p50)} min")
+                        st.success(
+                            f"✅ **All bands delivered consistently.** Room to tighten: "
+                            + "; ".join(_tip_parts) + ". "
+                            f"Use Config Editor to edit the headway profile and re-run."
+                        )
+                    else:
+                        st.success(
+                            f"✅ All bands delivered consistently within 1.2× of configured headway."
+                        )
 
                 # Unified per-band table
                 _unified_rows = []
                 if _feas_details and _rec_profile:
                     for _fd, _rp in zip(_feas_details, _rec_profile):
+                        _n_delivered = _rp.get("delivered_n", 0)
                         _unified_rows.append({
                             "Band":                    _fd["band"],
                             "Input (min)":             _fd["cfg_hw"],
+                            "Delivered p50":           f"{_fd.get('delivered_p50', 0):.0f}" if _n_delivered >= 3 else "—",
+                            "Delivered p90":           f"{_fd.get('delivered_p90', 0):.0f}" if _n_delivered >= 3 else "—",
                             "Physics Min (min)":       _fd["physics_min"],
-                            "Rec k=1.0 (min)":         _rp["headway_min"],
+                            "Rec (min)":               _rp["headway_min"],
                             "Peak band?":              "🔵 Peak" if _rp["is_peak"] else "○ Off-peak",
                             "Status":                  _fd["status"],
                         })
@@ -2722,10 +2783,11 @@ elif app_mode == "🏙️ Citywide":
                                  column_config={"Status": st.column_config.TextColumn(width="small"),
                                                 "Peak band?": st.column_config.TextColumn(width="small")})
                     st.caption(
-                        "**Physics Min** = (cycle_time_for_this_band + charging_RT) ÷ fleet + "
-                        f"{3} buffer (time-of-day variation applied per band).  \n"
-                        "**Rec k=1.0** = minimum stable headway preserving peak < off-peak ordering. "
-                        "Use Config Editor → k slider to scale up."
+                        "**Delivered p50** = median actual gap delivered in this band (robust to charging spikes).  \n"
+                        "**Delivered p90** = 90th-percentile actual gap (captures typical charging transitions).  \n"
+                        "**Physics Min** = ceil(band_cycle ÷ fleet) + safety buffer — honest floor when not charging.  \n"
+                        "**Rec** = k-scaled minimum delivered, clamped to physics floor. Feasibility uses delivered gaps, "
+                        "not theoretical worst-case."
                     )
                     # One-click apply button with k/alpha from Config Editor sliders
                     _apply_k     = st.session_state.get(f"k_slider_{selected_hw_route}", 1.0)
@@ -2733,66 +2795,43 @@ elif app_mode == "🏙️ Citywide":
                     _btn_label   = (f"⚡ Apply Recommended (k={_apply_k:.2f}, α={_apply_alpha:.2f}) "
                                     f"to {selected_hw_route}")
                     if _rec_profile and st.button(_btn_label, key=f"apply_rec_{selected_hw_route}"):
-                        from src.city_scheduler import _run_single_route as _rsr
                         from src.city_models import RouteInput as _RI
                         _ri_apply  = city_cfg.routes[selected_hw_route]
                         _smode     = st.session_state.get("city_mode_used", "planning")
-                        with st.spinner(f"Applying recommended headways (k={_apply_k:.2f}) "
-                                        f"to {selected_hw_route}…"):
+                        with st.spinner(f"Applying recommended headways to {selected_hw_route}…"):
                             try:
-                                _new_rr = _rsr(
-                                    _ri_apply,
+                                # Use the SNAPSHOT rec_profile already displayed on screen.
+                                # Do NOT re-run _run_single_route to regenerate it — that
+                                # would re-evaluate against post-apply delivered gaps and
+                                # create a feedback loop.
+                                _new_hw = pd.DataFrame([
+                                    {"time_from":  b["time_from"],
+                                     "time_to":    b["time_to"],
+                                     "headway_min": b["headway_min"]}
+                                    for b in _rec_profile
+                                ])
+                                _new_ri_r = _RI(config=_ri_apply.config, headway_df=_new_hw,
+                                                 travel_time_df=_ri_apply.travel_time_df)
+                                # Single scheduler run with the new headway_df.
+                                # _run_single_route computes its own empirical feasibility
+                                # against the freshly-delivered schedule — this is the
+                                # correct behavior (recommendation grounds itself in reality).
+                                from src.city_scheduler import _run_single_route as _rsr
+                                _applied_rr = _rsr(
+                                    _new_ri_r,
                                     scheduling_mode=_smode,
                                     rec_k=_apply_k,
                                     rec_alpha=_apply_alpha,
                                 )
-                                # Apply the recommended profile as the live headway_df
-                                _new_hw = pd.DataFrame([
-                                    {"time_from": b["time_from"], "time_to": b["time_to"],
-                                     "headway_min": b["headway_min"]}
-                                    for b in _new_rr.recommended_headway_profile
-                                ])
-                                # Re-run schedule with the recommended headways
-                                from src.trip_generator import generate_trips as _gtr
-                                from src.bus_scheduler  import schedule_buses as _sbr
-                                from src.metrics        import compute_metrics as _cmr
-                                _trips_r = _gtr(_ri_apply.config, _new_hw, _ri_apply.travel_time_df,
-                                                 scheduling_mode=_smode)
-                                _buses_r = _sbr(_ri_apply.config, _trips_r, headway_df=_new_hw,
-                                                 travel_time_df=_ri_apply.travel_time_df,
-                                                 scheduling_mode=_smode)
-                                _met_r   = _cmr(_ri_apply.config, _buses_r,
-                                                 total_revenue_trips=len([t for t in _trips_r
-                                                                           if t.trip_type == "Revenue"]))
-                                _new_ri_r = _RI(config=_ri_apply.config, headway_df=_new_hw,
-                                                 travel_time_df=_ri_apply.travel_time_df)
-                                from src.fleet_analyzer import compute_pvr_slices as _cpvr2
-                                _pvr_r = _cpvr2(_new_ri_r).pvr_peak
-                                # Rebuild RouteResult with updated fields
-                                from src.city_models import RouteResult as _RR2
-                                _applied_rr = _RR2(
-                                    route_code=selected_hw_route,
-                                    config=_ri_apply.config,
-                                    headway_df=_new_hw,
-                                    travel_time_df=_ri_apply.travel_time_df,
-                                    buses=_buses_r, metrics=_met_r, pvr=_pvr_r,
-                                    fleet_allocated=cs.results[selected_hw_route].fleet_allocated,
-                                    fleet_original=cs.results[selected_hw_route].fleet_original,
-                                    physics_min_headway=_new_rr.physics_min_headway,
-                                    rec_peak_headway=_new_rr.rec_peak_headway,
-                                    rec_offpeak_headway=_new_rr.rec_offpeak_headway,
-                                    recommended_headway_profile=_new_rr.recommended_headway_profile,
-                                    headway_feasibility_status=_new_rr.headway_feasibility_status,
-                                    headway_feasibility_details=_new_rr.headway_feasibility_details,
-                                    headway_source=(f"recommended" if _apply_k == 1.0
-                                                    else f"scaled:k{_apply_k:.2f}"),
-                                    headway_k=_apply_k,
-                                    headway_alpha=_apply_alpha,
-                                )
-                                cs.results[selected_hw_route] = _applied_rr
-                                city_cfg.routes[selected_hw_route] = _new_ri_r
-                                st.session_state["city_result"] = cs
-                                st.session_state["city_config"] = city_cfg
+                                # Preserve fleet allocation tracking
+                                _applied_rr.fleet_allocated = cs.results[selected_hw_route].fleet_allocated
+                                _applied_rr.fleet_original  = cs.results[selected_hw_route].fleet_original
+                                _applied_rr.headway_source  = (f"recommended" if _apply_k == 1.0
+                                                                else f"scaled:k{_apply_k:.2f}")
+                                cs.results[selected_hw_route]       = _applied_rr
+                                city_cfg.routes[selected_hw_route]  = _new_ri_r
+                                st.session_state["city_result"]     = cs
+                                st.session_state["city_config"]     = city_cfg
                                 st.success(
                                     f"✅ {selected_hw_route} rescheduled with "
                                     f"k={_apply_k:.2f} headways · "

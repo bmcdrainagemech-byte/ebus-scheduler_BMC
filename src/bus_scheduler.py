@@ -316,15 +316,22 @@ def _last_revenue_any_direction(buses, start_location):
                 break  # only need most recent per bus
     return latest
 
-def _check_p6(buses, trip, dep):
+def _check_p6(buses, trip, dep, exclude_bus=None):
     """
     P6: 5-min gap from the most-recent same-direction revenue trip of ANY other bus.
     Scans all trips (not just trips[-1]) to handle buses that charged/repositioned
     after their last revenue trip.
+
+    exclude_bus: the bus currently being evaluated — excluded from the scan so a
+    bus doesn't reject itself against its own previous revenue trip. Critical for
+    circular routes (where each loop ends where the next begins) and for buses
+    returning from a charging detour.
     """
     if trip.trip_type != "Revenue":
         return True
     for bus in buses:
+        if exclude_bus is not None and bus.bus_id == exclude_bus.bus_id:
+            continue
         last_rev = _last_revenue_in_direction(bus, trip.direction, trip.start_location)
         if last_rev is None:
             continue
@@ -333,15 +340,16 @@ def _check_p6(buses, trip, dep):
             return False
     return True
 
-def _bumped_ready_time(buses, trip, rt, natural_gap=None):
+def _bumped_ready_time(buses, trip, rt, natural_gap=None, exclude_bus=None):
     """
     Return rt bumped forward until P6 is satisfied.
     If natural_gap is provided, bumps by natural_gap to re-sync with fleet phase.
     Otherwise falls back to SAME_DIR_GAP increments.
+    exclude_bus is forwarded to _check_p6 to avoid self-comparison.
     """
     bump = natural_gap if natural_gap and natural_gap > SAME_DIR_GAP else SAME_DIR_GAP
     for _ in range(20):
-        if _check_p6(buses, trip, rt):
+        if _check_p6(buses, trip, rt, exclude_bus=exclude_bus):
             return rt
         rt += timedelta(minutes=bump)
     return rt
@@ -397,10 +405,19 @@ def _make_dead(bus, to_loc, dist, tt, config=None):
     return leg
 
 def _morning_dead_run(bus, config):
-    """DEPOT → nearest_node (P2, 1 leg only). Revenue starts from nearest_node."""
+    """DEPOT → nearest_node (P2, 1 leg only). Revenue starts from nearest_node.
+
+    If depot and nearest_node are colocated (dist=0), no physical dead run is
+    needed — but we must still move the bus to the nearest_node name. Otherwise
+    the main loop's `if bus.current_location == config.depot: continue` strands
+    the bus permanently.
+    """
     if bus.current_location != config.depot: return []
     nearest, dist, tt = _nearest_node_from_depot(config)
-    if dist <= 0: return []
+    if dist <= 0:
+        # Colocated depot+terminal: move bus virtually, no Trip record needed.
+        bus.current_location = nearest
+        return []
     return [_make_dead(bus, nearest, dist, tt, config=config)]
 
 def _route_to_depot(bus, config):
@@ -509,7 +526,10 @@ def _find_and_reposition(buses, trip, config, min_break):
         if arrival + timedelta(minutes=min_break) > op_end:
             continue
         soc_needed = bus._soc_cost(total_d) + bus._soc_cost(trip.distance_km)
-        if bus.soc_percent - soc_needed * 100 / bus.battery_kwh < SOC_FLOOR:
+        # _soc_cost() already returns a percentage value — do NOT multiply again.
+        # Previous buggy line divided by battery_kwh a second time, making the
+        # check trivially permissive (e.g. 10% drop compared as 10/210 = 0.05%).
+        if bus.soc_percent - soc_needed < SOC_FLOOR:
             continue
         candidates.append((total_t, bus, legs))
 
@@ -717,13 +737,21 @@ def schedule_buses(config: RouteConfig, trips: list[Trip],
 
     natural_gap = cycle_time / max(1, config.fleet_size)
 
-    # Phase 1 stagger gap: space buses at the minimum headway so they arrive
-    # pre-spaced at the correct service interval.
-    # Use the MINIMUM headway across all bands (usually peak headway) so the
-    # stagger matches the tightest service requirement — not the early-morning
-    # relaxed headway which would space buses too far apart and cause late starts
-    # for the last bus in the fleet (e.g. 4 buses × 40min = 160min late start).
+    # Phase 1 stagger gap: each bus should arrive at its target location at the
+    # time it will actually depart on its first revenue trip — zero idle wait.
+    #
+    # For a linear route: use the FIRST band's configured headway. Buses
+    # dispatched at first_band_hw-minute intervals will arrive pre-spaced at
+    # exactly the first band's service interval. No bus idles waiting for its
+    # target_dep slot. If a later bus would arrive after the first band ends,
+    # it is capped at peak headway so subsequent arrivals align with peak slots.
+    #
     # For circular routes: use early-morning headway (existing behaviour preserved).
+    #
+    # The OLD logic used min(headway across all bands), which is typically peak
+    # headway (15 min). With a first band of 25 min, this caused buses 2…N to
+    # arrive progressively earlier than their first-band slots, forcing 10/20/30/40
+    # min idle waits that compounded into 55–65 min breaks downstream.
     if is_circular and reposition_to and headway_df is not None:
         try:
             try:
@@ -734,10 +762,17 @@ def schedule_buses(config: RouteConfig, trips: list[Trip],
         except Exception:
             phase1_gap = natural_gap
     elif _hw_bands:
-        # Linear route: stagger by minimum configured headway across all bands,
-        # floored at natural_gap so buses are never closer than the fleet can support.
-        min_hw_all_bands = min(hw for _, _, hw in _hw_bands)
-        phase1_gap = max(natural_gap, min_hw_all_bands)
+        # Linear route: stagger by the FIRST band's headway.
+        # _hw_bands entries are (t_from, t_to, headway_min) sorted by time_from.
+        first_band_hw   = _hw_bands[0][2] if _hw_bands else natural_gap
+        min_hw_any_band = min(hw for _, _, hw in _hw_bands)
+        # Floor at natural_gap so buses are never closer than fleet can support.
+        phase1_gap = max(natural_gap, first_band_hw)
+        # Cap at 2× peak headway to prevent pathological early-morning bands
+        # (e.g. 60-min first band) from dispatching the last bus hours late.
+        # Buses that overflow the first band's capacity will arrive in the peak
+        # band — which is the right place for them anyway.
+        phase1_gap = min(phase1_gap, max(min_hw_any_band * 2, natural_gap))
     else:
         phase1_gap = natural_gap
 
@@ -1503,7 +1538,13 @@ def check_compliance(config: RouteConfig, buses: list[BusState],
 
     # P1
     p1_v = []
+    # Valid revenue endpoints: terminals + named intermediates.
+    # Shuttle trips (e.g. start→intermediate or intermediate→end) are legitimate
+    # revenue service and must not be flagged as P1 violations.
     valid = {config.start_point, config.end_point}
+    for _inter in getattr(config, "intermediates", []) or []:
+        if _inter and str(_inter).strip():
+            valid.add(str(_inter).strip())
     for bus in buses:
         for t in bus.trips:
             if t.trip_type == "Revenue":

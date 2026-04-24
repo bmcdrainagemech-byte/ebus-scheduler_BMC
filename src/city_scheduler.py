@@ -218,6 +218,101 @@ def _count_spikes(buses, headway_min: float, headway_df=None,
     return result
 
 
+def _empirical_band_gaps(buses, headway_df) -> dict:
+    """
+    Measure ACTUAL delivered departure gaps per band, per direction.
+
+    For each band in headway_df, compute the sorted list of gaps between
+    consecutive same-direction revenue departures whose lead bus departed
+    inside that band. Return per-band statistics:
+
+      {
+        "<band_key>": {
+          "band":         "HH:MM–HH:MM",
+          "cfg_hw":       int,
+          "n_gaps":       int,
+          "min_gap":      float,   # smallest delivered gap in band
+          "p50_gap":      float,   # median — robust central tendency
+          "p90_gap":      float,   # 90th percentile — excludes single-charge spike
+          "max_gap":      float,   # largest delivered gap in band
+        },
+        ...
+      }
+
+    Rationale:
+      - p50 (median) excludes the once-per-day charging spike → shows what the
+        scheduler consistently delivers.
+      - p90 includes typical charging transition but excludes pathological outliers.
+      - Comparing p50/p90 to configured headway gives an EMPIRICAL feasibility
+        check that doesn't over-weight theoretical worst-case charging cost.
+    """
+    from datetime import datetime as _dtb
+    import bisect
+
+    if headway_df is None or headway_df.empty:
+        return {}
+
+    # Build band list: [(band_key, start_min, end_min, cfg_hw), ...]
+    bands = []
+    for _, row in headway_df.iterrows():
+        try:
+            tf_str = str(row["time_from"]).strip()
+            tt_str = str(row["time_to"]).strip()
+            cfg    = int(row["headway_min"])
+            tf = _dtb.strptime(tf_str, "%H:%M")
+            tt = _dtb.strptime(tt_str, "%H:%M")
+            bands.append((f"{tf_str}–{tt_str}", cfg,
+                          tf.hour * 60 + tf.minute,
+                          tt.hour * 60 + tt.minute))
+        except Exception:
+            continue
+
+    if not bands:
+        return {}
+
+    # Collect gaps per band per direction
+    band_gaps = {b[0]: [] for b in bands}
+    for direction in ("UP", "DN"):
+        deps = sorted([
+            t.actual_departure for b in buses for t in b.trips
+            if t.trip_type == "Revenue" and t.direction == direction
+            and t.actual_departure is not None
+        ])
+        for i in range(1, len(deps)):
+            lead = deps[i - 1]
+            lead_min = lead.hour * 60 + lead.minute
+            gap = (deps[i] - deps[i - 1]).total_seconds() / 60.0
+            if gap <= 0:
+                continue
+            for (bkey, _cfg, s, e) in bands:
+                if s <= lead_min < e:
+                    band_gaps[bkey].append(gap)
+                    break
+
+    # Summarize
+    out = {}
+    for (bkey, cfg, _s, _e) in bands:
+        gaps = sorted(band_gaps.get(bkey, []))
+        if not gaps:
+            out[bkey] = {"band": bkey, "cfg_hw": cfg, "n_gaps": 0,
+                         "min_gap": 0.0, "p50_gap": 0.0,
+                         "p90_gap": 0.0, "max_gap": 0.0}
+            continue
+        n = len(gaps)
+        p50 = gaps[n // 2] if n > 0 else 0.0
+        p90 = gaps[min(n - 1, int(n * 0.9))]
+        out[bkey] = {
+            "band":    bkey,
+            "cfg_hw":  cfg,
+            "n_gaps":  n,
+            "min_gap": round(gaps[0], 1),
+            "p50_gap": round(p50, 1),
+            "p90_gap": round(p90, 1),
+            "max_gap": round(gaps[-1], 1),
+        }
+    return out
+
+
 def _natural_headway(ri: RouteInput) -> float:
     """
     Compute minimum constant headway that satisfies the spike-tolerance rule:
@@ -294,6 +389,129 @@ def _flat_headway_df(ri: RouteInput, headway_min: float) -> pd.DataFrame:
     }])
 
 
+def _empirical_recalibrate(
+    ri: RouteInput,
+    baseline_result: "RouteResult",
+    scheduling_mode: str = "efficiency",
+) -> "RouteResult":
+    """
+    Empirical recalibration for Resource Optimization mode.
+
+    Given a baseline schedule, measure what the fleet actually delivered per
+    band and tighten the configured headway toward that empirical minimum.
+    Then re-run the scheduler ONCE with the tightened profile.
+
+    Algorithm (per band):
+      rec_hw = max(
+          ceil(min_gap_delivered),           # honest lower bound
+          band_physics_continuous_min,       # hard physics floor
+      )
+      rec_hw = min(rec_hw, current_cfg_hw)   # never go UP — only tighten
+
+    The +1 margin on delivered_min prevents us from locking in a value the
+    scheduler hit exactly once by coincidence. For bands where the scheduler
+    delivered materially tighter than configured (delivered_min + 2 ≤ cfg), we
+    adopt the tighter value. For bands where it just met config, no change.
+
+    If no band can be tightened, returns baseline_result unchanged (no rerun).
+
+    Rationale: Resource Optimization promises "minimum viable service". If the
+    scheduler proves a tighter headway is achievable, we should capture that
+    gain in the delivered schedule, not just advertise it as a tip.
+    """
+    import math
+
+    if baseline_result is None or not baseline_result.buses:
+        return baseline_result
+
+    # Measure delivered gaps per band
+    emp = _empirical_band_gaps(baseline_result.buses, ri.headway_df)
+    if not emp:
+        return baseline_result
+
+    config     = ri.config
+    fleet      = max(1, config.fleet_size)
+    min_break  = config.preferred_layover_min
+
+    # Build recalibrated profile
+    recalibrated_rows = []
+    any_tightened = False
+
+    for _, row in ri.headway_df.iterrows():
+        try:
+            tf_str = str(row["time_from"]).strip()
+            tt_str = str(row["time_to"]).strip()
+            cfg_hw = int(row["headway_min"])
+        except Exception:
+            continue
+
+        # Per-band continuous physics floor (no charging amortization)
+        band_travel = 50.0
+        try:
+            from datetime import datetime as _dtr
+            t_band = _dtr.strptime(tf_str, "%H:%M")
+            for _, trow in ri.travel_time_df.iterrows():
+                try:
+                    tf2 = _dtr.strptime(str(trow["time_from"]).strip(), "%H:%M")
+                    tt2 = _dtr.strptime(str(trow["time_to"]).strip(),   "%H:%M")
+                    if tf2 <= t_band < tt2:
+                        band_travel = float(trow.get("up_min", trow.get("dn_min", 50)))
+                        break
+                except Exception:
+                    continue
+        except Exception:
+            pass
+        band_cycle   = band_travel * 2 + min_break * 2
+        band_h_phys  = math.ceil(band_cycle / fleet) + SPIKE_SAFETY_BUFFER
+
+        # Empirical minimum delivered + 1 min safety margin
+        band_key = f"{tf_str}–{tt_str}"
+        e = emp.get(band_key, {})
+        n_delivered = e.get("n_gaps", 0)
+        min_gap     = e.get("min_gap", 0.0)
+
+        if n_delivered >= 3 and min_gap > 0:
+            # Adopt the tighter of: delivered + 1 margin, or current cfg
+            empirical_target = math.ceil(min_gap) + 1
+            rec_hw = max(empirical_target, band_h_phys)
+        else:
+            rec_hw = cfg_hw
+
+        # Never raise above configured (this is a tightening pass only)
+        rec_hw = min(rec_hw, cfg_hw)
+
+        if rec_hw < cfg_hw - 1:   # require at least 2-min improvement
+            any_tightened = True
+
+        recalibrated_rows.append({
+            "time_from":   tf_str,
+            "time_to":     tt_str,
+            "headway_min": rec_hw,
+        })
+
+    if not any_tightened or not recalibrated_rows:
+        # No band improvable → keep baseline (save the rerun cost)
+        return baseline_result
+
+    # Re-run with the tightened profile, ONCE
+    recalibrated_df = pd.DataFrame(recalibrated_rows)
+    try:
+        new_result = _run_single_route(
+            ri,
+            fleet_override=baseline_result.fleet_allocated,
+            headway_df_override=recalibrated_df,
+            scheduling_mode=scheduling_mode,
+        )
+        # Preserve allocation tracking from baseline
+        new_result.fleet_allocated = baseline_result.fleet_allocated
+        new_result.fleet_original  = baseline_result.fleet_original
+        new_result.headway_source  = "empirical_recalibrated"
+        return new_result
+    except Exception:
+        # Recalibration failed — return baseline untouched
+        return baseline_result
+
+
 # ---------------------------------------------------------------------------
 # Single-route runner
 # ---------------------------------------------------------------------------
@@ -362,26 +580,66 @@ def _run_single_route(
         pvr_slices = compute_pvr_slices(ri)
 
         # ── Per-band physics minimum + recommended headway profile ────────────
-        # Uses time-of-day cycle variation: each band looks up its own travel
-        # time from travel_time_df rather than using the global worst-case.
+        # Two separate minimums are computed per band:
+        #
+        #   H_phys_continuous = ceil(band_cycle / fleet) + buffer
+        #     → minimum headway achievable WHEN NOT CHARGING (most of the day).
+        #     → this is the HONEST per-band floor.
+        #
+        #   H_phys_amortized  = ceil((band_cycle + RT/cycles_per_day) / fleet) + buffer
+        #     → minimum headway after distributing charging cost across all cycles.
+        #     → this is the AVERAGE floor over the full day.
+        #
+        # The old formula (band_cycle + RT) / fleet assumed EVERY cycle absorbed
+        # a full charging round-trip, which inflated the floor by a factor of
+        # ~N (where N = cycles per bus per day, typically 10–15). That made
+        # feasibility warnings fire for headways that were actually achievable.
         _rt         = _charging_rt(ri)
         _fleet      = max(1, config.fleet_size)
         _min_break  = config.preferred_layover_min
 
-        # Global worst-case for the scalar physics_min_headway (peak bands)
-        _max_cycle = 0.0
+        # Estimate cycles-per-day-per-bus for amortization
+        try:
+            _op_min = ((config.operating_end.hour * 60 + config.operating_end.minute)
+                       - (config.operating_start.hour * 60 + config.operating_start.minute))
+        except Exception:
+            _op_min = 840  # 14h fallback
+        _max_cycle_for_ppd = 0.0
         for _, _row in ri.travel_time_df.iterrows():
             try:
                 _up = float(_row["up_min"]); _dn = float(_row["dn_min"])
-                _max_cycle = max(_max_cycle, _up + _dn + _min_break * 2)
+                _max_cycle_for_ppd = max(_max_cycle_for_ppd, _up + _dn + _min_break * 2)
             except Exception:
                 pass
-        if _max_cycle == 0:
-            _max_cycle = 2 * 50 + 2 * _min_break
-        _h_phys   = math.ceil((_max_cycle + _rt) / _fleet) + SPIKE_SAFETY_BUFFER
-        # Multiplicative formula: H_peak = k × H_phys, H_offpeak = H_peak × (1 + alpha)
-        _rec_peak = math.ceil(rec_k * _h_phys)
-        _rec_offp = math.ceil(_rec_peak * (1.0 + rec_alpha))
+        if _max_cycle_for_ppd <= 0:
+            _max_cycle_for_ppd = 2 * 50 + 2 * _min_break
+        _cycles_per_day = max(1.0, _op_min / _max_cycle_for_ppd)
+
+        # Global worst-case (used for the scalar physics_min_headway field).
+        # Uses continuous formula — matches the per-band honest minimum.
+        _h_phys_continuous = math.ceil(_max_cycle_for_ppd / _fleet) + SPIKE_SAFETY_BUFFER
+        _h_phys_amortized  = math.ceil((_max_cycle_for_ppd + _rt / _cycles_per_day) / _fleet) + SPIKE_SAFETY_BUFFER
+        _h_phys = _h_phys_continuous  # honest floor for UI display
+
+        # ── Empirical per-band delivered gaps (from the actual schedule) ──────
+        _emp_bands = _empirical_band_gaps(buses, headway_df)
+
+        # Recommendation: minimum headway the scheduler ACTUALLY delivered.
+        # Uses p50 (median) per band — charging spikes are in the tail, not median.
+        # Fall back to continuous physics min if empirical data unavailable.
+        _emp_peak_p50    = min(
+            (v["p50_gap"] for v in _emp_bands.values() if v["n_gaps"] >= 3),
+            default=_h_phys_continuous,
+        )
+        _emp_offpeak_p50 = max(
+            (v["p50_gap"] for v in _emp_bands.values() if v["n_gaps"] >= 3),
+            default=_h_phys_continuous + 5,
+        )
+        # Apply user k/alpha scaling to the empirical baseline
+        _rec_peak = max(_h_phys_continuous,
+                        math.ceil(rec_k * max(_emp_peak_p50, _h_phys_continuous)))
+        _rec_offp = max(_rec_peak + 1,
+                        math.ceil(_rec_peak * (1.0 + rec_alpha)))
 
         # Identify peak bands (those with the minimum configured headway)
         _peak_windows = _detect_peak_windows(headway_df)
@@ -390,6 +648,7 @@ def _run_single_route(
         _rec_profile  = []
         _feas_details = []
         _any_infeas   = False
+        _any_marginal = False
 
         from datetime import datetime as _dt_band
 
@@ -416,12 +675,14 @@ def _run_single_route(
                 _cfg_hw  = int(_hw_row["headway_min"])
             except Exception:
                 continue
-            # Time-of-day cycle for this band
-            _band_travel  = _band_tt(_tf_str)
-            _band_cycle   = _band_travel * 2 + _min_break * 2
-            _band_h_phys  = math.ceil((_band_cycle + _rt) / _fleet) + SPIKE_SAFETY_BUFFER
 
-            # Is this band a peak band?
+            # Per-band HONEST floor (continuous, no charging amortization)
+            _band_travel     = _band_tt(_tf_str)
+            _band_cycle      = _band_travel * 2 + _min_break * 2
+            _band_h_cont     = math.ceil(_band_cycle / _fleet) + SPIKE_SAFETY_BUFFER
+            _band_h_amort    = math.ceil((_band_cycle + _rt / _cycles_per_day) / _fleet) + SPIKE_SAFETY_BUFFER
+
+            # Peak detection
             try:
                 _bh = _dt_band.strptime(_tf_str, "%H:%M")
                 _band_h_float = _bh.hour + _bh.minute / 60
@@ -429,30 +690,71 @@ def _run_single_route(
             except Exception:
                 _is_peak = False
 
+            # Recommended value for this band: the k-scaled empirical minimum,
+            # clamped to the continuous floor so we never recommend below physics.
             _band_rec    = _rec_peak if _is_peak else _rec_offp
-            _band_rec    = max(_band_rec, _band_h_phys)  # never below band's own minimum
-            _infeasible  = _cfg_hw < _band_h_phys
+            _band_rec    = max(_band_rec, _band_h_cont)
 
-            if _infeasible:
-                _any_infeas = True
+            # ── Empirical feasibility: compare ACTUAL delivered gaps to config ──
+            _ebnd = _emp_bands.get(f"{_tf_str}–{_tt_str}", {})
+            _p50  = _ebnd.get("p50_gap", 0.0)
+            _p90  = _ebnd.get("p90_gap", 0.0)
+            _n    = _ebnd.get("n_gaps",  0)
+
+            # Decision logic:
+            #   OK:          median delivered ≤ 1.2 × configured  (consistent match)
+            #   MARGINAL:    median within 1.2× but p90 > 1.5× configured
+            #                (charging transition spikes visible)
+            #   INFEASIBLE:  median > 1.5 × configured
+            #                (schedule CAN'T hit target consistently)
+            #
+            # When we have no empirical data (n<3), fall back to continuous
+            # physics check — but only flag INFEASIBLE if cfg is genuinely
+            # below the per-band continuous floor.
+            if _n < 3:
+                if _cfg_hw < _band_h_cont:
+                    _status = "❌ INFEASIBLE"
+                    _any_infeas = True
+                else:
+                    _status = "✅ OK"
+            else:
+                if _p50 > 1.5 * _cfg_hw:
+                    _status = "❌ INFEASIBLE"
+                    _any_infeas = True
+                elif _p50 > 1.2 * _cfg_hw or _p90 > 1.5 * _cfg_hw:
+                    _status = "⚠ MARGINAL"
+                    _any_marginal = True
+                else:
+                    _status = "✅ OK"
 
             _rec_profile.append({
-                "time_from":   _tf_str,
-                "time_to":     _tt_str,
-                "headway_min": _band_rec,
-                "is_peak":     _is_peak,
-                "physics_min": _band_h_phys,
-                "cfg_hw":      _cfg_hw,
+                "time_from":       _tf_str,
+                "time_to":         _tt_str,
+                "headway_min":     _band_rec,
+                "is_peak":         _is_peak,
+                "physics_min":     _band_h_cont,       # continuous (honest) floor
+                "physics_amort":   _band_h_amort,      # amortized (average) floor
+                "cfg_hw":          _cfg_hw,
+                "delivered_p50":   _p50,
+                "delivered_p90":   _p90,
+                "delivered_n":     _n,
             })
             _feas_details.append({
-                "band":        f"{_tf_str}–{_tt_str}",
-                "cfg_hw":      _cfg_hw,
-                "physics_min": _band_h_phys,
-                "rec":         _band_rec,
-                "status":      "❌ INFEASIBLE" if _infeasible else "✅ OK",
+                "band":            f"{_tf_str}–{_tt_str}",
+                "cfg_hw":          _cfg_hw,
+                "physics_min":     _band_h_cont,
+                "delivered_p50":   _p50,
+                "delivered_p90":   _p90,
+                "rec":             _band_rec,
+                "status":          _status,
             })
 
-        _feas_status = "INFEASIBLE" if _any_infeas else "OK"
+        if _any_infeas:
+            _feas_status = "INFEASIBLE"
+        elif _any_marginal:
+            _feas_status = "MARGINAL"
+        else:
+            _feas_status = "OK"
 
         # ── Spike counts (all modes) ──────────────────────────────────────────
         # Use the widest headway band (off-peak H) as the comparison threshold,
@@ -672,13 +974,26 @@ def _schedule_kpi_driven(city: CityConfig) -> CitySchedule:
                     alloc_so_far   -= 1
 
     # ── Final run ────────────────────────────────────────────────────────────
+    # Two-pass per route:
+    #   Pass A: run with config headway at allocated fleet → baseline
+    #   Pass B: measure delivered gaps, tighten headway where scheduler
+    #           outperformed config, re-run ONCE → final
+    # If no band can be tightened, Pass B is skipped (baseline is the result).
     results: dict[str, RouteResult] = {}
     for code, ri in city.routes.items():
         fleet = adjusted.get(code, min_fleets.get(code, ri.config.fleet_size))
-        results[code] = _run_single_route(ri, fleet_override=fleet,
-                                          scheduling_mode="efficiency")
-        results[code].fleet_allocated = fleet
-        results[code].fleet_original  = ri.config.fleet_size
+        baseline = _run_single_route(ri, fleet_override=fleet,
+                                     scheduling_mode="efficiency")
+        baseline.fleet_allocated = fleet
+        baseline.fleet_original  = ri.config.fleet_size
+
+        # Empirical recalibration — tighten headway to what the scheduler
+        # actually delivered, then re-run once. Only for Resource Optimization
+        # (this mode's purpose is to minimize headway for the given fleet).
+        final = _empirical_recalibrate(ri, baseline, scheduling_mode="efficiency")
+        final.fleet_allocated = fleet
+        final.fleet_original  = ri.config.fleet_size
+        results[code] = final
 
     return CitySchedule(city_config=city, results=results,
                         transfers=transfers, stability_flags=[])
