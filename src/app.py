@@ -1528,7 +1528,7 @@ with st.sidebar:
         'CEPT Research &amp; Development Foundation</div>'
         '<div style="font-size:1.15rem;font-weight:700;color:#1a1a2e;'
         'margin-bottom:2px;">🚌 eBus Scheduler</div>'
-        '<div style="font-size:0.72rem;color:#888;">AMTS · Ahmedabad · v1 Phase 1</div>',
+        '<div style="font-size:0.72rem;color:#888;">Ahmedabad · v1</div>',
         unsafe_allow_html=True,
     )
 
