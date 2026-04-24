@@ -218,6 +218,46 @@ def _count_spikes(buses, headway_min: float, headway_df=None,
     return result
 
 
+def _parse_time_str(val) -> "datetime | None":
+    """
+    Robustly parse a time value that may arrive as:
+      - datetime.time  → direct access (.hour, .minute)
+      - str "HH:MM"   → strptime %H:%M
+      - str "HH:MM:SS"→ strptime %H:%M:%S  (happens when str(datetime.time) is used)
+    Returns a datetime on 1900-01-01 for comparison, or None on failure.
+    """
+    from datetime import datetime as _dtp, time as _tp
+    if isinstance(val, _tp):
+        return _dtp(1900, 1, 1, val.hour, val.minute)
+    s = str(val).strip()
+    for fmt in ("%H:%M", "%H:%M:%S"):
+        try:
+            return _dtp.strptime(s, fmt)
+        except ValueError:
+            continue
+    return None
+
+
+def _parse_band_time(val) -> "datetime | None":
+    """
+    Robustly parse a headway band time value to datetime on REF_DATE.
+    Handles: datetime.time objects, "HH:MM", "HH:MM:SS" strings.
+    Returns None on failure.
+    """
+    from datetime import datetime as _dt, time as _time
+    REF = _dt(2025, 1, 1)
+    if isinstance(val, _time):
+        return REF.replace(hour=val.hour, minute=val.minute)
+    try:
+        s = str(val).strip()
+        # Strip seconds if present (Excel sometimes emits HH:MM:SS)
+        parts = s.split(":")
+        h, m = int(parts[0]), int(parts[1])
+        return REF.replace(hour=h, minute=m)
+    except Exception:
+        return None
+
+
 def _empirical_band_gaps(buses, headway_df) -> dict:
     """
     Measure ACTUAL delivered departure gaps per band, per direction.
@@ -252,18 +292,21 @@ def _empirical_band_gaps(buses, headway_df) -> dict:
     if headway_df is None or headway_df.empty:
         return {}
 
-    # Build band list: [(band_key, start_min, end_min, cfg_hw), ...]
+    # Build band list with normalized "HH:MM" keys so they always match,
+    # regardless of whether time_from is stored as datetime.time or string.
     bands = []
     for _, row in headway_df.iterrows():
         try:
-            tf_str = str(row["time_from"]).strip()
-            tt_str = str(row["time_to"]).strip()
+            tf_dt = _parse_time_str(row["time_from"])
+            tt_dt = _parse_time_str(row["time_to"])
+            if tf_dt is None or tt_dt is None:
+                continue
             cfg    = int(row["headway_min"])
-            tf = _dtb.strptime(tf_str, "%H:%M")
-            tt = _dtb.strptime(tt_str, "%H:%M")
-            bands.append((f"{tf_str}–{tt_str}", cfg,
-                          tf.hour * 60 + tf.minute,
-                          tt.hour * 60 + tt.minute))
+            tf_str = tf_dt.strftime("%H:%M")   # normalize to HH:MM
+            tt_str = tt_dt.strftime("%H:%M")
+            s_min  = tf_dt.hour * 60 + tf_dt.minute
+            e_min  = tt_dt.hour * 60 + tt_dt.minute
+            bands.append((f"{tf_str}–{tt_str}", cfg, s_min, e_min))
         except Exception:
             continue
 
@@ -439,34 +482,35 @@ def _empirical_recalibrate(
 
     for _, row in ri.headway_df.iterrows():
         try:
-            tf_str = str(row["time_from"]).strip()
-            tt_str = str(row["time_to"]).strip()
+            tf_dt  = _parse_time_str(row["time_from"])
+            tt_dt  = _parse_time_str(row["time_to"])
+            if tf_dt is None or tt_dt is None:
+                continue
+            tf_str = tf_dt.strftime("%H:%M")
+            tt_str = tt_dt.strftime("%H:%M")
             cfg_hw = int(row["headway_min"])
         except Exception:
             continue
 
-        # Per-band continuous physics floor (no charging amortization)
+        # Per-band continuous physics floor
         band_travel = 50.0
-        try:
-            from datetime import datetime as _dtr
-            t_band = _dtr.strptime(tf_str, "%H:%M")
-            for _, trow in ri.travel_time_df.iterrows():
-                try:
-                    tf2 = _dtr.strptime(str(trow["time_from"]).strip(), "%H:%M")
-                    tt2 = _dtr.strptime(str(trow["time_to"]).strip(),   "%H:%M")
-                    if tf2 <= t_band < tt2:
-                        band_travel = float(trow.get("up_min", trow.get("dn_min", 50)))
-                        break
-                except Exception:
-                    continue
-        except Exception:
-            pass
+        for _, trow in ri.travel_time_df.iterrows():
+            try:
+                tf2 = _parse_time_str(trow["time_from"])
+                tt2 = _parse_time_str(trow["time_to"])
+                if tf2 is not None and tt2 is not None and tf2 <= tf_dt < tt2:
+                    band_travel = float(trow.get("up_min", trow.get("dn_min", 50)))
+                    break
+            except Exception:
+                continue
         band_cycle   = band_travel * 2 + min_break * 2
-        band_h_phys  = math.ceil(band_cycle / fleet) + SPIKE_SAFETY_BUFFER
+        # Bare physics floor — no buffer. Buffer is a scheduling margin,
+        # not a lower bound on what is achievable.
+        band_h_phys  = math.ceil(band_cycle / fleet)
 
-        # Empirical minimum delivered + 1 min safety margin
-        band_key = f"{tf_str}–{tt_str}"
-        e = emp.get(band_key, {})
+        # Empirical minimum — key normalized to HH:MM (matches _empirical_band_gaps output)
+        band_key    = f"{tf_str}–{tt_str}"
+        e           = emp.get(band_key, {})
         n_delivered = e.get("n_gaps", 0)
         min_gap     = e.get("min_gap", 0.0)
 
@@ -484,7 +528,7 @@ def _empirical_recalibrate(
             any_tightened = True
 
         recalibrated_rows.append({
-            "time_from":   tf_str,
+            "time_from":   tf_str,   # normalized HH:MM
             "time_to":     tt_str,
             "headway_min": rec_hw,
         })
@@ -617,9 +661,9 @@ def _run_single_route(
 
         # Global worst-case (used for the scalar physics_min_headway field).
         # Uses continuous formula — matches the per-band honest minimum.
-        _h_phys_continuous = math.ceil(_max_cycle_for_ppd / _fleet) + SPIKE_SAFETY_BUFFER
-        _h_phys_amortized  = math.ceil((_max_cycle_for_ppd + _rt / _cycles_per_day) / _fleet) + SPIKE_SAFETY_BUFFER
-        _h_phys = _h_phys_continuous  # honest floor for UI display
+        _h_phys_continuous = math.ceil(_max_cycle_for_ppd / _fleet)   # bare physics floor — no buffer
+        _h_phys_amortized  = math.ceil((_max_cycle_for_ppd + _rt / _cycles_per_day) / _fleet)
+        _h_phys = _h_phys_continuous  # displayed in UI — honest, no buffer inflation
 
         # ── Empirical per-band delivered gaps (from the actual schedule) ──────
         _emp_bands = _empirical_band_gaps(buses, headway_df)
@@ -650,19 +694,16 @@ def _run_single_route(
         _any_infeas   = False
         _any_marginal = False
 
-        from datetime import datetime as _dt_band
-
         def _band_tt(time_from_str) -> float:
             """Fetch travel time for this band from travel_time_df."""
-            try:
-                t = _dt_band.strptime(str(time_from_str).strip(), "%H:%M")
-            except Exception:
+            t = _parse_time_str(time_from_str)
+            if t is None:
                 return 50.0
             for _, _trow in ri.travel_time_df.iterrows():
                 try:
-                    tf = _dt_band.strptime(str(_trow["time_from"]).strip(), "%H:%M")
-                    tt = _dt_band.strptime(str(_trow["time_to"]).strip(),   "%H:%M")
-                    if tf <= t < tt:
+                    tf = _parse_time_str(_trow["time_from"])
+                    tt = _parse_time_str(_trow["time_to"])
+                    if tf is not None and tt is not None and tf <= t < tt:
                         return float(_trow.get("up_min", _trow.get("dn_min", 50)))
                 except Exception:
                     continue
@@ -670,32 +711,40 @@ def _run_single_route(
 
         for _, _hw_row in headway_df.iterrows():
             try:
-                _tf_str  = str(_hw_row["time_from"]).strip()
-                _tt_str  = str(_hw_row["time_to"]).strip()
+                _tf_dt   = _parse_time_str(_hw_row["time_from"])
+                _tt_dt   = _parse_time_str(_hw_row["time_to"])
+                if _tf_dt is None or _tt_dt is None:
+                    continue
+                _tf_str  = _tf_dt.strftime("%H:%M")   # normalized HH:MM
+                _tt_str  = _tt_dt.strftime("%H:%M")
                 _cfg_hw  = int(_hw_row["headway_min"])
             except Exception:
                 continue
 
-            # Per-band HONEST floor (continuous, no charging amortization)
-            _band_travel     = _band_tt(_tf_str)
-            _band_cycle      = _band_travel * 2 + _min_break * 2
-            _band_h_cont     = math.ceil(_band_cycle / _fleet) + SPIKE_SAFETY_BUFFER
-            _band_h_amort    = math.ceil((_band_cycle + _rt / _cycles_per_day) / _fleet) + SPIKE_SAFETY_BUFFER
+            # Per-band floors:
+            #   _band_h_cont      = BARE physics floor (feasibility check — no buffer)
+            #   _band_h_rec_floor = buffered floor (recommendation margin only)
+            # Keeping buffer out of feasibility check prevents achievable headways being
+            # flagged INFEASIBLE. E.g. R1 peak: ceil(90/6)=15 = cfg → ✅ OK
+            # (with buffer: 15+3=18 > 15 → wrongly INFEASIBLE).
+            _band_travel      = _band_tt(_tf_dt)
+            _band_cycle       = _band_travel * 2 + _min_break * 2
+            _band_h_cont      = math.ceil(_band_cycle / _fleet)             # bare — feasibility
+            _band_h_amort     = math.ceil((_band_cycle + _rt / _cycles_per_day) / _fleet)
+            _band_h_rec_floor = _band_h_cont + SPIKE_SAFETY_BUFFER          # buffered — rec only
 
-            # Peak detection
+            # Peak detection using normalized datetime
             try:
-                _bh = _dt_band.strptime(_tf_str, "%H:%M")
-                _band_h_float = _bh.hour + _bh.minute / 60
+                _band_h_float = _tf_dt.hour + _tf_dt.minute / 60
                 _is_peak = any(s <= _band_h_float < e for s, e in _peak_windows)
             except Exception:
                 _is_peak = False
 
-            # Recommended value for this band: the k-scaled empirical minimum,
-            # clamped to the continuous floor so we never recommend below physics.
+            # Recommended value: clamped to the buffered floor so rec is never too tight
             _band_rec    = _rec_peak if _is_peak else _rec_offp
-            _band_rec    = max(_band_rec, _band_h_cont)
+            _band_rec    = max(_band_rec, _band_h_rec_floor)
 
-            # ── Empirical feasibility: compare ACTUAL delivered gaps to config ──
+            # Empirical lookup — key must match normalized format used in _empirical_band_gaps
             _ebnd = _emp_bands.get(f"{_tf_str}–{_tt_str}", {})
             _p50  = _ebnd.get("p50_gap", 0.0)
             _p90  = _ebnd.get("p90_gap", 0.0)
@@ -712,9 +761,12 @@ def _run_single_route(
             # physics check — but only flag INFEASIBLE if cfg is genuinely
             # below the per-band continuous floor.
             if _n < 3:
+                # No empirical data — fall back to bare physics comparison.
+                # Do NOT add SPIKE_SAFETY_BUFFER here: it's a scheduling margin
+                # for recommendations, not a feasibility threshold.
                 if _cfg_hw < _band_h_cont:
-                    _status = "❌ INFEASIBLE"
-                    _any_infeas = True
+                    _status = "⚠ TIGHT"   # below bare physics floor — likely infeasible
+                    _any_marginal = True
                 else:
                     _status = "✅ OK"
             else:
