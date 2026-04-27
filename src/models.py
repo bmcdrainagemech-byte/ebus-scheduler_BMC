@@ -226,6 +226,27 @@ class RouteConfig:
     # cycle_time_effective = up + dn + 2×preferred_layover + 2×recovery_buffer
     recovery_buffer_min: int = 0
 
+    # v11 (Phase E): labor-law / driver-rest config.
+    # Defaults match common driver-rest regulations: max 12 hours total
+    # duty spread, max 4 hours continuous driving, 20-min regulatory
+    # break required to reset the continuous-driving counter. Adjust per
+    # local labor law via config; 0 = check disabled.
+    max_duty_hours: float = 12.0
+    max_continuous_driving_min: int = 240    # 4 hours
+    regulatory_break_min: int = 20
+
+    # v10 (Phase C): per-route break policy overrides.
+    # Optional `Break_Policy` sheet in the route Excel:
+    #   Break_Node | Action | Peak_Only | Notes
+    # Action ∈ {"Remove", "Add"}.
+    #   "Remove" — at this node, do not enforce preferred_layover_min;
+    #              treat as fast turnaround instead.
+    #   "Add"    — RESERVED for Phase D. Loader accepts the value but the
+    #              scheduler currently ignores it (logged but no behaviour).
+    # Peak_Only — when True, the rule applies only during peak hours.
+    # Each entry stored as a dict for forward-compatibility.
+    break_policy: list = field(default_factory=list)
+
     @property
     def depot_flow_rate_kw(self) -> float:
         return self.depot_charger_kw * self.depot_charger_efficiency

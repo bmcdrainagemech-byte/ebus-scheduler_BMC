@@ -70,6 +70,8 @@ def generate_recommendations(city_schedule) -> list[Recommendation]:
       P3 — Fleet surplus/deficit transfer opportunities
       P4 — Depot charger utilisation
       P5 — Minor optimisations (km balance, dead-km)
+      P3 — min_km_per_bus policy violation (Phase D)
+      P2 — charging trips after p5_charging_end (Phase D)
     """
     recs: list[Recommendation] = []
 
@@ -82,6 +84,8 @@ def generate_recommendations(city_schedule) -> list[Recommendation]:
     _check_charging_window(city_schedule, recs)
     _check_km_balance(city_schedule, recs)
     _check_dead_km(city_schedule, recs)
+    _check_min_km_per_bus(city_schedule, recs)        # Phase D #4, #8
+    _check_p5_window_charging(city_schedule, recs)    # Phase D Bug #1 signal
 
     # Sort by priority (lowest = most critical)
     recs.sort(key=lambda r: (r.priority, r.category))
@@ -312,6 +316,228 @@ def _check_dead_km(cs, recs: list):
                 confidence="medium",
             ))
 
+
+def _check_min_km_per_bus(cs, recs: list):
+    """
+    P3: Buses on this route are running less than the configured min_km_per_bus
+    policy. Emits up to two recommendation variants per under-policy route:
+
+      Variant A — fleet reduction. If reducing the fleet by 1 keeps PVR
+      satisfied, the same revenue trips would be redistributed across N-1
+      buses, lifting avg km/bus by approximately:
+          new_avg = current_avg * fleet / (fleet - 1)
+      Confidence: high if the fleet reduction still meets PVR with margin.
+
+      Variant B — headway tightening. If the route is at or near PVR (so
+      fleet reduction is not viable), tightening peak headway by 2 min is
+      the next lever — more revenue trips per bus. Confidence: medium since
+      the achievable headway depends on route physics.
+
+    Why this matters (planner-facing): min_km_per_bus is a policy obligation
+    (CRDF: 180 km/bus/day default). Buses below this number are
+    underutilised assets — the operator pays fixed costs (driver, energy
+    standby, depreciation) without proportional revenue.
+    """
+    for code, r in cs.results.items():
+        cfg = r.config
+        min_km_policy = float(getattr(cfg, "min_km_per_bus", 0) or 0)
+        if min_km_policy <= 0:
+            continue  # not enforced for this route
+
+        km_list = list(getattr(r.metrics, "km_per_bus", []) or [])
+        if not km_list:
+            continue
+
+        avg_km = sum(km_list) / len(km_list)
+        min_km_actual = min(km_list)
+        below_count = sum(1 for k in km_list if k < min_km_policy)
+
+        # Trigger: any bus below policy, OR route avg below policy.
+        if below_count == 0 and avg_km >= min_km_policy:
+            continue
+
+        fleet = r.fleet_allocated or len(km_list)
+        pvr = max(1, int(r.pvr or 1))
+
+        # ── Variant A: fleet reduction (preferred when feasible) ───────────
+        if fleet > pvr:
+            new_fleet = fleet - 1
+            # First-order estimate: same revenue km redistributed.
+            new_avg = avg_km * fleet / new_fleet if new_fleet > 0 else avg_km
+            meets_policy = new_avg >= min_km_policy
+
+            recs.append(Recommendation(
+                category="fleet_adjustment",
+                priority=3,
+                route_codes=[code],
+                action=(f"Reduce {code} fleet from {fleet} to {new_fleet} "
+                        f"(PVR={pvr}, so safe)"),
+                reason=(f"Avg km/bus is {avg_km:.0f} km — below policy "
+                        f"of {min_km_policy:.0f} km. {below_count} of {len(km_list)} "
+                        f"bus(es) ran less than {min_km_policy:.0f} km. "
+                        f"Fleet ({fleet}) exceeds PVR ({pvr}) by "
+                        f"{fleet - pvr} bus(es), so reducing by 1 preserves "
+                        f"peak service."),
+                expected_impact=(
+                    f"Avg km/bus rises from {avg_km:.0f} to ~{new_avg:.0f} km "
+                    + ("(meets policy). " if meets_policy
+                       else f"(still below {min_km_policy:.0f}). ")
+                    + f"Releases 1 bus for redeployment elsewhere or maintenance. "
+                    f"No headway impact."
+                ),
+                confidence="high" if meets_policy else "medium",
+            ))
+            continue  # Don't emit Variant B if A is viable.
+
+        # ── Variant B: headway tightening (when fleet already at PVR) ──────
+        # We don't have access to physics_min_headway in metrics here, but
+        # rec_peak_headway on the RouteResult is an upper bound for what's
+        # safe. Suggest 2-min tightening from current peak.
+        try:
+            cur_peak = int(r.headway_df["headway_min"].min())
+        except Exception:
+            cur_peak = 10
+        target_peak = max(cur_peak - 2, int(getattr(r, "physics_min_headway", 0) or 0) or 5)
+        if target_peak >= cur_peak:
+            target_peak = max(5, cur_peak - 1)
+
+        recs.append(Recommendation(
+            category="headway_change",
+            priority=3,
+            route_codes=[code],
+            action=(f"Tighten {code} peak headway from {cur_peak} to {target_peak} min "
+                    f"(fleet already at PVR={pvr}, so cannot reduce)"),
+            reason=(f"Avg km/bus is {avg_km:.0f} km — below policy "
+                    f"of {min_km_policy:.0f} km. Fleet of {fleet} matches PVR "
+                    f"({pvr}), so reducing fleet would break peak service. "
+                    f"Tighter headway = more revenue trips per bus per day."),
+            expected_impact=(
+                f"More trips per bus during peak hours. "
+                f"Estimated lift: +{(cur_peak/target_peak - 1) * 100:.0f}% peak trips "
+                f"if physics allows. Verify on the Headways sub-tab — if the "
+                f"physics minimum is above {target_peak} min, this won't be feasible."
+            ),
+            confidence="medium",
+        ))
+
+
+def _check_p5_window_charging(cs, recs: list):
+    """
+    P2: Charging trips that started after the configured p5_charging_end.
+
+    This is the recommendation-side counterpart to the Phase A diagnostic
+    XLSX export. The diagnostic tells you which trigger fired; this check
+    tells the planner the count is non-zero and points them to the export.
+
+    Only emits one recommendation per route, regardless of count.
+    """
+    for code, r in cs.results.items():
+        cfg = r.config
+        p5_end = getattr(cfg, "p5_charging_end", None)
+        if p5_end is None:
+            continue
+
+        late_count = 0
+        for bus in r.buses:
+            for trip in bus.trips:
+                if trip.trip_type != "Charging":
+                    continue
+                if trip.actual_departure is None:
+                    continue
+                dep = trip.actual_departure
+                if (dep.hour, dep.minute) > (p5_end.hour, p5_end.minute):
+                    late_count += 1
+
+        if late_count == 0:
+            continue
+
+        recs.append(Recommendation(
+            category="charging_window",
+            priority=2,
+            route_codes=[code],
+            action=(f"Investigate {late_count} charging trip(s) on {code} "
+                    f"that started after p5_charging_end "
+                    f"({p5_end.strftime('%H:%M')})"),
+            reason=(f"Late charging is usually driven by SOC_TRIGGER_OFFPEAK "
+                    f"(bus crossed trigger after the P5 window closed) or "
+                    f"SOC_P3_OVERRIDE (next trip would have breached SOC floor). "
+                    f"Both are legitimate — but if frequent, the P5 stagger cap "
+                    f"(fleet // 5) may be too restrictive, leaving too many "
+                    f"buses to charge late."),
+            expected_impact=(
+                f"Download the decision-log XLSX from the Depot & Terminals "
+                f"tab to see exactly which trigger fired for each late charge. "
+                f"If most are SOC_TRIGGER_OFFPEAK, raise trigger_soc_percent "
+                f"or relax the P5 stagger cap."
+            ),
+            confidence="medium",
+        ))
+
+
+
+
+# ── Phase E: operational-difficulty grouping ────────────────────────────────
+# Per external review (#8): planners need to see recommendations sorted by
+# how disruptive each one is, not just by priority. A "P5 km balance" tweak
+# is fundamentally easier than a "P3 fleet reduction" — even though P5 < P3
+# in priority terms.
+#
+# Difficulty buckets:
+#   easy       — redistribute trips on the same route (no extra cost,
+#                no fleet change, no schedule rebuild)
+#   moderate   — adjust layover/dead-running patterns or single-route
+#                headway tweak
+#   significant — add/remove trips on the schedule, or change charging window
+#   major       — fleet size change, infrastructure change, route redesign
+_DIFFICULTY_RULES: list[tuple[str, str]] = [
+    # (substring matched in category OR action, difficulty)
+    ("km balance", "easy"),
+    ("review", "easy"),
+    ("trigger_soc", "moderate"),
+    ("p5_charging", "moderate"),
+    ("layover", "moderate"),
+    ("recovery_buffer", "moderate"),
+    ("headway_change", "moderate"),
+    ("dead-km", "moderate"),
+    ("dead_km", "moderate"),
+    ("charging_window", "moderate"),
+    ("transfer", "significant"),
+    ("redistribute", "significant"),
+    ("rebalance", "significant"),
+    ("Reduce", "major"),
+    ("Increase fleet", "major"),
+    ("fleet_adjustment", "major"),
+    ("depot", "major"),
+    ("infrastructure", "major"),
+    ("terminal charger", "major"),
+]
+
+
+def _classify_difficulty(rec: "Recommendation") -> str:
+    """Return one of: easy, moderate, significant, major."""
+    haystack = f"{rec.category} {rec.action}".lower()
+    for needle, level in _DIFFICULTY_RULES:
+        if needle.lower() in haystack:
+            return level
+    # Default conservative: priority 1-2 = major (safety/compliance), else moderate.
+    if rec.priority <= 2:
+        return "major"
+    return "moderate"
+
+
+def group_by_difficulty(recs: list["Recommendation"]) -> dict[str, list["Recommendation"]]:
+    """
+    Group recommendations into operational-difficulty buckets.
+
+    Returns dict with keys "easy", "moderate", "significant", "major" — empty
+    keys are still present so callers can render in fixed order.
+    """
+    groups: dict[str, list[Recommendation]] = {
+        "easy": [], "moderate": [], "significant": [], "major": [],
+    }
+    for r in recs:
+        groups[_classify_difficulty(r)].append(r)
+    return groups
 
 # ── Summary helpers ───────────────────────────────────────────────────────────
 

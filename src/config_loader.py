@@ -665,5 +665,105 @@ def load_config(excel_path: str | Path) -> tuple[RouteConfig, pd.DataFrame, pd.D
     headway_df     = _parse_headway(wb)
     travel_time_df = _parse_travel_time(wb)
 
+    # ── Phase C: parse optional Break_Policy sheet ─────────────────────────────
+    # Schema: Break_Node | Action | Peak_Only | Notes
+    # If the sheet is absent the field stays empty (no behaviour change for
+    # routes that don't opt in).
+    config.break_policy = _parse_break_policy(wb, config)
+
     wb.close()
     return config, headway_df, travel_time_df
+
+
+def _parse_break_policy(wb, config) -> list[dict]:
+    """
+    Read optional `Break_Policy` sheet.
+
+    Schema (header row, case-insensitive, any order):
+      Break_Node | Action | Peak_Only | Notes
+
+    Action values (case-insensitive): "Remove" | "Add"
+      - Remove: at this node, fast turnaround instead of preferred_layover_min
+      - Add:    take a break at this intermediate (RESERVED for Phase D — the
+                loader accepts the value but the scheduler does not yet act
+                on it. This keeps the schema forward-compatible.)
+    Peak_Only: "Yes"/"No"/"True"/"False" (case-insensitive). Default No.
+    Notes: free text — stored verbatim, never parsed.
+
+    Returns a list of dicts:
+      [{"break_node": str, "action": "Remove"|"Add", "peak_only": bool,
+        "notes": str}, ...]
+    Returns [] if the sheet is missing, empty, or has no valid rows.
+
+    Validation rules:
+      - break_node must match an operational node on this route
+        (start_point, end_point, or an intermediate). Rules referencing
+        unknown nodes are silently dropped — the route still loads.
+      - action must be "Remove" or "Add" (case-insensitive). Other values
+        cause the row to be dropped.
+    """
+    ws = _find_sheet(wb, "Break_Policy", "BreakPolicy", "break_policy")
+    if ws is None:
+        return []
+
+    # Locate header row and column indices
+    header_row = None
+    col_idx: dict[str, int] = {}
+    for r in range(1, min(ws.max_row, 10) + 1):
+        row_vals = {
+            c: str(ws.cell(r, c).value or "").strip().lower()
+            for c in range(1, ws.max_column + 1)
+        }
+        if "break_node" in row_vals.values() and "action" in row_vals.values():
+            header_row = r
+            for c, v in row_vals.items():
+                if v in ("break_node", "action", "peak_only", "notes"):
+                    col_idx[v] = c
+            break
+
+    if header_row is None:
+        return []
+
+    if "break_node" not in col_idx or "action" not in col_idx:
+        return []
+
+    # Build the set of operational nodes for validation
+    op_nodes = {config.start_point, config.end_point}
+    for n in (config.intermediates or []):
+        if n and str(n).strip():
+            op_nodes.add(str(n).strip())
+
+    out: list[dict] = []
+    for r in range(header_row + 1, ws.max_row + 1):
+        node_raw = ws.cell(r, col_idx["break_node"]).value
+        action_raw = ws.cell(r, col_idx["action"]).value
+        if node_raw is None or str(node_raw).strip() == "":
+            # Empty row — treat as end-of-data sentinel
+            break
+
+        node = str(node_raw).strip()
+        action = str(action_raw or "").strip().lower()
+        if action not in ("remove", "add"):
+            continue
+        if node not in op_nodes:
+            # Silently drop rules pointing at nodes we don't know about.
+            continue
+
+        peak_only = False
+        if "peak_only" in col_idx:
+            v = ws.cell(r, col_idx["peak_only"]).value
+            peak_only = str(v or "").strip().lower() in ("yes", "true", "y", "1")
+
+        notes = ""
+        if "notes" in col_idx:
+            v = ws.cell(r, col_idx["notes"]).value
+            notes = str(v or "").strip()
+
+        out.append({
+            "break_node": node,
+            "action": action.capitalize(),   # "Remove" | "Add"
+            "peak_only": peak_only,
+            "notes": notes,
+        })
+
+    return out

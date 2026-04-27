@@ -113,11 +113,20 @@ def render_planning_summary(city_schedule) -> None:
         if recs:
             for rec in recs[:6]:
                 rt = ", ".join(rec.route_codes) if rec.route_codes else "All"
+                # Phase D #9: expected_impact rendered as hover tooltip via
+                # title= attribute on the wrapping div. Plain English, no
+                # technical metric jargon.
+                _impact = (rec.expected_impact or "").replace('"', "'")
+                _conf = (rec.confidence or "").lower()
+                _conf_pill = (
+                    f'<span class="ps-rc ps-rc-{_conf}">{_conf}</span>'
+                    if _conf in ("high", "medium", "low") else ""
+                )
                 st.markdown(
-                    f'<div class="ps-rec">'
+                    f'<div class="ps-rec" title="Why useful: {_impact}">'
                     f'<div class="ps-rp ps-rp{rec.priority}">P{rec.priority}</div>'
                     f'<div class="ps-rr">{rt}</div>'
-                    f'<div><div class="ps-ra">{rec.action}</div>'
+                    f'<div><div class="ps-ra">{rec.action} {_conf_pill}</div>'
                     f'<div class="ps-rx">{rec.reason}</div></div></div>',
                     unsafe_allow_html=True)
         else:

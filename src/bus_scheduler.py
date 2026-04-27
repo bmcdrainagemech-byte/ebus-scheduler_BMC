@@ -40,6 +40,10 @@ SAME_DIR_GAP      = 5
 DEPOT_DWELL_MIN   = 35
 DEPOT_DWELL_MAX   = 50
 KM_BALANCE_MAX    = 20.0
+# Phase C: fast turnaround applied at nodes flagged Action=Remove in
+# Break_Policy. Just enough for handover and door operations — no driver rest.
+# Driver rest is taken elsewhere on the schedule via natural gaps.
+FAST_TURNAROUND_MIN = 2
 # Global Headway Balancer weight: each 1-min deviation from target headway
 # counts as HEADWAY_WEIGHT minutes of ready-time penalty in bus selection.
 # Higher = more uniform headways, lower = faster throughput. 2.0 is a good default.
@@ -173,14 +177,34 @@ def _in_charge_window(bus, config) -> bool:
     return False
 
 
-def _effective_break(config, current_time: datetime, base_break: int) -> int:
+def _effective_break(config, current_time: datetime, base_break: int,
+                     current_location: str | None = None) -> int:
     """
     Return break minutes before the next revenue trip.
 
     During off-peak (11:00-15:00) the break is extended by
     off_peak_layover_extra_min (default 10) to widen headways naturally,
     capped at max_layover_min so P4 is never violated by construction.
+
+    Phase C: if `current_location` is provided and matches a Break_Policy
+    rule with Action="Remove" (and Peak_Only honored), return a short
+    turnaround time instead of the full break. This is the dispatcher
+    pain-point fix for terminal accumulation (e.g. GANGAJALIYA).
     """
+    # ── Phase C: per-location break overrides via Break_Policy ───────────
+    # Applied first so it can short-circuit the off-peak extension below.
+    if current_location is not None:
+        policy = getattr(config, "break_policy", None) or []
+        for rule in policy:
+            if rule.get("action") != "Remove":
+                continue
+            if rule.get("break_node") != current_location:
+                continue
+            if rule.get("peak_only") and not _is_peak(current_time):
+                continue
+            # Match — use fast turnaround.
+            return FAST_TURNAROUND_MIN
+
     if _is_off_peak(current_time):
         extra = getattr(config, 'off_peak_layover_extra_min', 0)
         max_b = getattr(config, 'max_layover_min', MAX_BREAK)
@@ -283,12 +307,15 @@ def _fleet_avg_km(buses):
 def _ready_time(bus, min_break, config=None):
     """
     Departure-ready time for the bus.
-    After Revenue: adds min_break (extended during off-peak if config provided).
+    After Revenue: adds min_break (extended during off-peak if config provided,
+                   shortened to FAST_TURNAROUND_MIN if a Break_Policy
+                   Remove rule applies at the bus's current location).
     After Dead/Charging/Shuttle: immediate.
     """
     last = bus.trips[-1] if bus.trips else None
     if last and last.trip_type == "Revenue":
-        effective = (_effective_break(config, bus.current_time, min_break)
+        effective = (_effective_break(config, bus.current_time, min_break,
+                                       current_location=bus.current_location)
                      if config is not None else min_break)
         return bus.current_time + timedelta(minutes=effective)
     return bus.current_time
@@ -316,22 +343,15 @@ def _last_revenue_any_direction(buses, start_location):
                 break  # only need most recent per bus
     return latest
 
-def _check_p6(buses, trip, dep, exclude_bus=None):
+def _check_p6(buses, trip, dep):
     """
     P6: 5-min gap from the most-recent same-direction revenue trip of ANY other bus.
     Scans all trips (not just trips[-1]) to handle buses that charged/repositioned
     after their last revenue trip.
-
-    exclude_bus: the bus currently being evaluated — excluded from the scan so a
-    bus doesn't reject itself against its own previous revenue trip. Critical for
-    circular routes (where each loop ends where the next begins) and for buses
-    returning from a charging detour.
     """
     if trip.trip_type != "Revenue":
         return True
     for bus in buses:
-        if exclude_bus is not None and bus.bus_id == exclude_bus.bus_id:
-            continue
         last_rev = _last_revenue_in_direction(bus, trip.direction, trip.start_location)
         if last_rev is None:
             continue
@@ -340,16 +360,15 @@ def _check_p6(buses, trip, dep, exclude_bus=None):
             return False
     return True
 
-def _bumped_ready_time(buses, trip, rt, natural_gap=None, exclude_bus=None):
+def _bumped_ready_time(buses, trip, rt, natural_gap=None):
     """
     Return rt bumped forward until P6 is satisfied.
     If natural_gap is provided, bumps by natural_gap to re-sync with fleet phase.
     Otherwise falls back to SAME_DIR_GAP increments.
-    exclude_bus is forwarded to _check_p6 to avoid self-comparison.
     """
     bump = natural_gap if natural_gap and natural_gap > SAME_DIR_GAP else SAME_DIR_GAP
     for _ in range(20):
-        if _check_p6(buses, trip, rt, exclude_bus=exclude_bus):
+        if _check_p6(buses, trip, rt):
             return rt
         rt += timedelta(minutes=bump)
     return rt
@@ -405,19 +424,10 @@ def _make_dead(bus, to_loc, dist, tt, config=None):
     return leg
 
 def _morning_dead_run(bus, config):
-    """DEPOT → nearest_node (P2, 1 leg only). Revenue starts from nearest_node.
-
-    If depot and nearest_node are colocated (dist=0), no physical dead run is
-    needed — but we must still move the bus to the nearest_node name. Otherwise
-    the main loop's `if bus.current_location == config.depot: continue` strands
-    the bus permanently.
-    """
+    """DEPOT → nearest_node (P2, 1 leg only). Revenue starts from nearest_node."""
     if bus.current_location != config.depot: return []
     nearest, dist, tt = _nearest_node_from_depot(config)
-    if dist <= 0:
-        # Colocated depot+terminal: move bus virtually, no Trip record needed.
-        bus.current_location = nearest
-        return []
+    if dist <= 0: return []
     return [_make_dead(bus, nearest, dist, tt, config=config)]
 
 def _route_to_depot(bus, config):
@@ -526,10 +536,7 @@ def _find_and_reposition(buses, trip, config, min_break):
         if arrival + timedelta(minutes=min_break) > op_end:
             continue
         soc_needed = bus._soc_cost(total_d) + bus._soc_cost(trip.distance_km)
-        # _soc_cost() already returns a percentage value — do NOT multiply again.
-        # Previous buggy line divided by battery_kwh a second time, making the
-        # check trivially permissive (e.g. 10% drop compared as 10/210 = 0.05%).
-        if bus.soc_percent - soc_needed < SOC_FLOOR:
+        if bus.soc_percent - soc_needed * 100 / bus.battery_kwh < SOC_FLOOR:
             continue
         candidates.append((total_t, bus, legs))
 
@@ -737,21 +744,13 @@ def schedule_buses(config: RouteConfig, trips: list[Trip],
 
     natural_gap = cycle_time / max(1, config.fleet_size)
 
-    # Phase 1 stagger gap: each bus should arrive at its target location at the
-    # time it will actually depart on its first revenue trip — zero idle wait.
-    #
-    # For a linear route: use the FIRST band's configured headway. Buses
-    # dispatched at first_band_hw-minute intervals will arrive pre-spaced at
-    # exactly the first band's service interval. No bus idles waiting for its
-    # target_dep slot. If a later bus would arrive after the first band ends,
-    # it is capped at peak headway so subsequent arrivals align with peak slots.
-    #
+    # Phase 1 stagger gap: space buses at the minimum headway so they arrive
+    # pre-spaced at the correct service interval.
+    # Use the MINIMUM headway across all bands (usually peak headway) so the
+    # stagger matches the tightest service requirement — not the early-morning
+    # relaxed headway which would space buses too far apart and cause late starts
+    # for the last bus in the fleet (e.g. 4 buses × 40min = 160min late start).
     # For circular routes: use early-morning headway (existing behaviour preserved).
-    #
-    # The OLD logic used min(headway across all bands), which is typically peak
-    # headway (15 min). With a first band of 25 min, this caused buses 2…N to
-    # arrive progressively earlier than their first-band slots, forcing 10/20/30/40
-    # min idle waits that compounded into 55–65 min breaks downstream.
     if is_circular and reposition_to and headway_df is not None:
         try:
             try:
@@ -762,17 +761,10 @@ def schedule_buses(config: RouteConfig, trips: list[Trip],
         except Exception:
             phase1_gap = natural_gap
     elif _hw_bands:
-        # Linear route: stagger by the FIRST band's headway.
-        # _hw_bands entries are (t_from, t_to, headway_min) sorted by time_from.
-        first_band_hw   = _hw_bands[0][2] if _hw_bands else natural_gap
-        min_hw_any_band = min(hw for _, _, hw in _hw_bands)
-        # Floor at natural_gap so buses are never closer than fleet can support.
-        phase1_gap = max(natural_gap, first_band_hw)
-        # Cap at 2× peak headway to prevent pathological early-morning bands
-        # (e.g. 60-min first band) from dispatching the last bus hours late.
-        # Buses that overflow the first band's capacity will arrive in the peak
-        # band — which is the right place for them anyway.
-        phase1_gap = min(phase1_gap, max(min_hw_any_band * 2, natural_gap))
+        # Linear route: stagger by minimum configured headway across all bands,
+        # floored at natural_gap so buses are never closer than the fleet can support.
+        min_hw_all_bands = min(hw for _, _, hw in _hw_bands)
+        phase1_gap = max(natural_gap, min_hw_all_bands)
     else:
         phase1_gap = natural_gap
 
@@ -1538,13 +1530,7 @@ def check_compliance(config: RouteConfig, buses: list[BusState],
 
     # P1
     p1_v = []
-    # Valid revenue endpoints: terminals + named intermediates.
-    # Shuttle trips (e.g. start→intermediate or intermediate→end) are legitimate
-    # revenue service and must not be flagged as P1 violations.
     valid = {config.start_point, config.end_point}
-    for _inter in getattr(config, "intermediates", []) or []:
-        if _inter and str(_inter).strip():
-            valid.add(str(_inter).strip())
     for bus in buses:
         for t in bus.trips:
             if t.trip_type == "Revenue":
@@ -1764,6 +1750,123 @@ def check_compliance(config: RouteConfig, buses: list[BusState],
             "details": (f"All buses within {max_km:.0f} km cap" if not over_v
                         else f"{len(over_v)} bus(es) exceeded cap{unassigned_note}"),
             "violations": over_v,
+        })
+
+    # ── O5: Driver duty-hour spread (Phase E #13) ────────────────────────────
+    # Total span from first dispatch to final return. Long spreads with idle
+    # time still count — the driver is on duty during layovers.
+    max_duty_h = float(getattr(config, "max_duty_hours", 12.0) or 0)
+    if max_duty_h > 0:
+        o5_v = []
+        for bus in buses:
+            if not bus.trips:
+                continue
+            first_dep = next((t.actual_departure for t in bus.trips
+                              if t.actual_departure), None)
+            last_arr = next((t.actual_arrival for t in reversed(bus.trips)
+                             if t.actual_arrival), None)
+            if first_dep is None or last_arr is None:
+                continue
+            spread_h = (last_arr - first_dep).total_seconds() / 3600.0
+            if spread_h > max_duty_h:
+                o5_v.append(
+                    f"{bus.bus_id}: {spread_h:.1f}h spread "
+                    f"({first_dep.strftime('%H:%M')}–{last_arr.strftime('%H:%M')}) "
+                    f"> {max_duty_h:.0f}h limit"
+                )
+        results.append({
+            "rule":     f"O5: Driver duty spread <= {max_duty_h:.0f} hours",
+            "priority": 11,
+            "status":   "PASS" if not o5_v else "FAIL",
+            "details":  ("All buses within duty limit" if not o5_v
+                         else f"{len(o5_v)} bus(es) exceed limit"),
+            "violations": o5_v,
+        })
+
+    # ── O6: Continuous driving without break (Phase E #13 + #7 safety) ───────
+    # Walk each bus's trip sequence, accumulate driving time. Any layover
+    # >= regulatory_break_min OR any non-Revenue trip (Charging/Dead) resets
+    # the counter. If the accumulated continuous driving exceeds the limit,
+    # that's a labor-law concern — and a flag for any Break_Policy Remove
+    # rule that may have caused it.
+    max_cont_min = int(getattr(config, "max_continuous_driving_min", 240) or 0)
+    reg_brk = int(getattr(config, "regulatory_break_min", 20) or 0)
+    if max_cont_min > 0:
+        o6_v = []
+        for bus in buses:
+            cont = 0  # minutes of continuous driving accumulator
+            worst = 0
+            worst_when = None
+            prev_arr = None
+            for t in bus.trips:
+                if t.actual_departure is None or t.actual_arrival is None:
+                    continue
+                # Gap from prev arrival to this departure resets if >= reg break
+                if prev_arr is not None:
+                    gap = (t.actual_departure - prev_arr).total_seconds() / 60.0
+                    if gap >= reg_brk:
+                        cont = 0
+                # Non-Revenue trips (Charging, Dead) reset the counter — driver
+                # is not actively driving passenger service. Conservative: even
+                # Dead resets, since it's still a break from passenger duty.
+                if t.trip_type != "Revenue":
+                    cont = 0
+                else:
+                    cont += int(t.travel_time_min)
+                    if cont > worst:
+                        worst = cont
+                        worst_when = t.actual_arrival
+                prev_arr = t.actual_arrival
+            if worst > max_cont_min:
+                when_str = worst_when.strftime('%H:%M') if worst_when else '?'
+                o6_v.append(
+                    f"{bus.bus_id}: {worst} min continuous driving "
+                    f"(by {when_str}) > {max_cont_min} min limit"
+                )
+        results.append({
+            "rule":     f"O6: Continuous driving <= {max_cont_min} min "
+                        f"(reg break >= {reg_brk} min)",
+            "priority": 12,
+            "status":   "PASS" if not o6_v else "FAIL",
+            "details":  ("All buses within continuous-driving limit" if not o6_v
+                         else f"{len(o6_v)} bus(es) exceed limit — "
+                              "check Break_Policy Remove rules"),
+            "violations": o6_v,
+        })
+
+    # ── O7: Break_Policy Remove safety guard (Phase E #7) ────────────────────
+    # If the route has any Break_Policy Action=Remove rules AND O6 has FAIL
+    # entries, surface the link explicitly so the planner doesn't have to
+    # cross-reference.
+    bp = getattr(config, "break_policy", None) or []
+    remove_rules = [r for r in bp if (r.get("action") or "").lower() == "remove"]
+    if remove_rules:
+        # Did O6 fail? If so, flag.
+        o6_failed = any(r["rule"].startswith("O6:") and r["status"] == "FAIL"
+                        for r in results)
+        nodes_str = ", ".join(r.get("break_node", "?") for r in remove_rules)
+        peak_str = " (peak only)" if any(r.get("peak_only") for r in remove_rules) else ""
+        if o6_failed:
+            status = "FAIL"
+            details = (
+                f"Break removed at: {nodes_str}{peak_str}. "
+                f"At least one bus exceeded continuous-driving limit (see O6) — "
+                f"removing this break may be unsafe under labor law. "
+                f"Either re-enable the break, set Peak_Only=Yes to limit scope, "
+                f"or add Action=Add at an intermediate node (Phase E+ feature)."
+            )
+        else:
+            status = "PASS"
+            details = (
+                f"Break removed at: {nodes_str}{peak_str}. "
+                f"All buses still within continuous-driving limit — safe."
+            )
+        results.append({
+            "rule":     "O7: Break_Policy Remove safety check",
+            "priority": 13,
+            "status":   status,
+            "details":  details,
+            "violations": [],
         })
 
     return results

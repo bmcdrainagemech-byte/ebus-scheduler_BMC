@@ -229,6 +229,14 @@ class CitySchedule:
             m = r.metrics
             donated = sum(1 for t in self.transfers if t.from_route == code)
             received = sum(1 for t in self.transfers if t.to_route == code)
+
+            # Enh #5: avg km/bus and min km/bus per route — surfaced on main view.
+            km_list = list(getattr(m, "km_per_bus", []) or [])
+            avg_km = (sum(km_list) / len(km_list)) if km_list else 0.0
+            min_km_actual = min(km_list) if km_list else 0.0
+            min_km_policy = float(getattr(r.config, "min_km_per_bus", 0) or 0)
+            below_min = (min_km_policy > 0 and min_km_actual < min_km_policy)
+
             rows.append({
                 "Route": code,
                 "Name": r.config.route_name,
@@ -242,6 +250,10 @@ class CitySchedule:
                 "Rev KM": round(m.revenue_km, 1),
                 "Dead KM": round(m.dead_km, 1),
                 "Dead %": f"{m.dead_km_ratio:.1%}",
+                "Avg KM/Bus": round(avg_km, 1),
+                "Min KM/Bus": round(min_km_actual, 1),
+                "Min KM Policy": round(min_km_policy, 1) if min_km_policy > 0 else "—",
+                "Below Min?": "YES" if below_min else "",
                 "Min SOC": f"{m.min_soc_seen:.1f}%",
                 "LOS": getattr(m, "los_grade", ""),
                 "Avg Wait": f"{getattr(m, 'avg_wait_min', 0):.0f} min",

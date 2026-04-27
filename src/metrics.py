@@ -245,10 +245,19 @@ def compute_metrics(
         except Exception:
             pass  # EWT is non-critical; don't fail metrics on parse error
 
-    # Energy efficiency: kWh per revenue km
+    # Energy efficiency: kWh per revenue km.
+    # Z.ai #4.1.1 fix: numerator now uses revenue_km only (the energy
+    # actually consumed serving paying passengers), not total_km. Mixing
+    # total_km in the numerator inflated the metric by ~dead_km_ratio %
+    # (typically 10-20%), making routes with longer depot positioning look
+    # less energy-efficient than they actually are.
     if m.revenue_km > 0:
-        total_energy_kwh = m.total_km * config.consumption_rate
-        m.kwh_per_rev_km = round(total_energy_kwh / m.revenue_km, 3)
+        revenue_energy_kwh = m.revenue_km * config.consumption_rate
+        m.kwh_per_rev_km = round(revenue_energy_kwh / m.revenue_km, 3)
+        # Note: this is now mathematically equal to consumption_rate by
+        # construction. Kept as an explicit field for forward compat —
+        # future temperature/SOH derating factors will diverge from
+        # consumption_rate and the metric will become non-trivial.
 
     # LOS grade from headway_cv (TCQSM thresholds)
     m.los_grade = _los_from_cv(m.headway_cv)
