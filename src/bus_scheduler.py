@@ -182,27 +182,51 @@ def _effective_break(config, current_time: datetime, base_break: int,
     """
     Return break minutes before the next revenue trip.
 
-    During off-peak (11:00-15:00) the break is extended by
-    off_peak_layover_extra_min (default 10) to widen headways naturally,
-    capped at max_layover_min so P4 is never violated by construction.
+    Resolution order (first match wins):
+      1. Phase F: Break_Policy Action="Add" at this location
+         -> force max(regulatory_break_min, base_break) so the driver
+         gets a full reset break here.
+      2. Phase C: Break_Policy Action="Remove" at this location
+         -> return FAST_TURNAROUND_MIN (2 min) instead of the full break.
+      3. Off-peak (11:00-15:00): extend by off_peak_layover_extra_min,
+         capped at max_layover_min.
+      4. Default: return base_break unchanged.
 
-    Phase C: if `current_location` is provided and matches a Break_Policy
-    rule with Action="Remove" (and Peak_Only honored), return a short
-    turnaround time instead of the full break. This is the dispatcher
-    pain-point fix for terminal accumulation (e.g. GANGAJALIYA).
+    Both 1 and 2 honor the rule's Peak_Only flag.
+
+    Note: Add takes priority over Remove. If the same node has both
+    rules (an unusual config), Add wins because labor-law compliance
+    is more important than terminal congestion. This is also why
+    auto_patch._gen_continuous_driving_patches flags Remove conflicts
+    instead of silently overriding them.
     """
-    # ── Phase C: per-location break overrides via Break_Policy ───────────
-    # Applied first so it can short-circuit the off-peak extension below.
+    # ── Phase F: Action=Add — force regulatory break ─────────────────────
     if current_location is not None:
         policy = getattr(config, "break_policy", None) or []
+        reg_brk = int(getattr(config, "regulatory_break_min", 20) or 0)
+        max_b = getattr(config, 'max_layover_min', MAX_BREAK)
         for rule in policy:
-            if rule.get("action") != "Remove":
+            if (rule.get("action") or "").lower() != "add":
                 continue
             if rule.get("break_node") != current_location:
                 continue
             if rule.get("peak_only") and not _is_peak(current_time):
                 continue
-            # Match — use fast turnaround.
+            # Match — force regulatory-length break, capped at max_layover.
+            # base_break is preserved as the floor so Add never SHORTENS
+            # an existing long break.
+            return min(max(reg_brk, base_break), max_b)
+
+    # ── Phase C: Action=Remove — fast turnaround ─────────────────────────
+    if current_location is not None:
+        policy = getattr(config, "break_policy", None) or []
+        for rule in policy:
+            if (rule.get("action") or "").lower() != "remove":
+                continue
+            if rule.get("break_node") != current_location:
+                continue
+            if rule.get("peak_only") and not _is_peak(current_time):
+                continue
             return FAST_TURNAROUND_MIN
 
     if _is_off_peak(current_time):
@@ -1841,7 +1865,6 @@ def check_compliance(config: RouteConfig, buses: list[BusState],
     bp = getattr(config, "break_policy", None) or []
     remove_rules = [r for r in bp if (r.get("action") or "").lower() == "remove"]
     if remove_rules:
-        # Did O6 fail? If so, flag.
         o6_failed = any(r["rule"].startswith("O6:") and r["status"] == "FAIL"
                         for r in results)
         nodes_str = ", ".join(r.get("break_node", "?") for r in remove_rules)
@@ -1853,7 +1876,7 @@ def check_compliance(config: RouteConfig, buses: list[BusState],
                 f"At least one bus exceeded continuous-driving limit (see O6) — "
                 f"removing this break may be unsafe under labor law. "
                 f"Either re-enable the break, set Peak_Only=Yes to limit scope, "
-                f"or add Action=Add at an intermediate node (Phase E+ feature)."
+                f"or add Action=Add at a node where buses naturally layover."
             )
         else:
             status = "PASS"
@@ -1866,6 +1889,26 @@ def check_compliance(config: RouteConfig, buses: list[BusState],
             "priority": 13,
             "status":   status,
             "details":  details,
+            "violations": [],
+        })
+
+    # ── O8: Break_Policy Add rule status (Phase F) ───────────────────────────
+    # Reports active Add rules in the compliance feed. Status is INFO
+    # (always PASS) — the rule itself isn't a violation, but the planner
+    # needs to see it surface in the audit trail alongside Remove rules.
+    add_rules = [r for r in bp if (r.get("action") or "").lower() == "add"]
+    if add_rules:
+        nodes_str = ", ".join(r.get("break_node", "?") for r in add_rules)
+        peak_str = " (peak only)" if any(r.get("peak_only") for r in add_rules) else ""
+        reg_brk = int(getattr(config, "regulatory_break_min", 20) or 0)
+        results.append({
+            "rule":     "O8: Break_Policy Add rules active",
+            "priority": 14,
+            "status":   "INFO",
+            "details":  (f"Forcing regulatory break (>= {reg_brk} min) at: "
+                          f"{nodes_str}{peak_str}. Layovers at these nodes "
+                          f"will be at least {reg_brk} min instead of "
+                          f"preferred_layover_min ({config.preferred_layover_min} min)."),
             "violations": [],
         })
 

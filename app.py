@@ -2605,6 +2605,268 @@ elif app_mode == "Citywide":
         # Planning summary: recommendations + alerts + route table
         render_planning_summary(cs)
 
+        # ════════════════════════════════════════════════════════════════════
+        # PHASE F — Late-charging KPI tiles + Break Policy diag + Auto-Patch
+        # ════════════════════════════════════════════════════════════════════
+
+        # ── F3: Per-route late-charging KPI tiles ──────────────────────────
+        try:
+            from src.diagnostics import collect_charging_trip_rows as _cct
+            _cct_rows = _cct(cs)
+
+            # Aggregate per route
+            _route_charge: dict[str, dict] = {}
+            for row in _cct_rows:
+                rc = row["Route"]
+                d = _route_charge.setdefault(rc, {
+                    "total": 0, "late": 0, "triggers": {},
+                })
+                d["total"] += 1
+                if row["Late?"] == "YES":
+                    d["late"] += 1
+                    trig = row.get("Trigger (from log)", "OTHER")
+                    d["triggers"][trig] = d["triggers"].get(trig, 0) + 1
+
+            late_routes = {rc: v for rc, v in _route_charge.items() if v["late"] > 0}
+
+            if late_routes:
+                st.markdown('<div class="section-title">Late Charging by Route</div>',
+                            unsafe_allow_html=True)
+                st.caption(
+                    "Routes with charging trips that started after their configured "
+                    "p5_charging_end. Drill into the Depot & Terminals tab for the "
+                    "full decision-log XLSX."
+                )
+                _ncols = min(4, len(late_routes))
+                _cols = st.columns(_ncols)
+                for i, (rc, v) in enumerate(sorted(late_routes.items(),
+                                                     key=lambda kv: -kv[1]["late"])):
+                    with _cols[i % _ncols]:
+                        pct = (v["late"] / v["total"] * 100) if v["total"] else 0
+                        # Dominant trigger
+                        if v["triggers"]:
+                            dom_trig = max(v["triggers"].items(), key=lambda kv: kv[1])
+                            dom_str = f"{dom_trig[0]} ({dom_trig[1]})"
+                        else:
+                            dom_str = "—"
+
+                        # Inline mini-tile (matches existing kpi() helper styling)
+                        _color = "#dc2626" if pct >= 25 else "#d97706" if pct >= 10 else "#475569"
+                        st.markdown(
+                            f'<div style="border:1px solid #e5e7eb; padding:8px 12px; '
+                            f'border-radius:4px; margin-bottom:6px; background:white;">'
+                            f'<div style="font-size:0.7rem; color:#888; '
+                            f'letter-spacing:0.4px; text-transform:uppercase;">Route {rc}</div>'
+                            f'<div style="font-size:1.4rem; font-weight:700; color:{_color}; '
+                            f'line-height:1.1; margin-top:2px;">'
+                            f'{v["late"]} <span style="font-size:0.85rem; color:#888; '
+                            f'font-weight:500;">/ {v["total"]} ({pct:.0f}%)</span></div>'
+                            f'<div style="font-size:0.72rem; color:#475569; '
+                            f'margin-top:4px;">Dominant: <b>{dom_str}</b></div>'
+                            f'<div style="font-size:0.68rem; color:#888; '
+                            f'margin-top:2px;">After p5_charging_end</div>'
+                            f'</div>',
+                            unsafe_allow_html=True,
+                        )
+                # Plain-English planner action line
+                st.caption(
+                    "**Planner action:** if SOC_TRIGGER_OFFPEAK dominates, the P5 "
+                    "window may be closing too early. Check the Auto-Patch panel "
+                    "below — it can propose extending p5_charging_end automatically."
+                )
+        except Exception as _kpi_err:
+            st.caption(f"Late-charging KPIs unavailable: {_kpi_err}")
+
+        # ── F4: Break Policy diagnostics block ──────────────────────────────
+        _bp_diag_rows = []
+        _o6_violations: list[str] = []
+        try:
+            from src.bus_scheduler import check_compliance as _cc_for_bp
+            for _bcode, _bp_rr in cs.results.items():
+                _bp_pol = getattr(_bp_rr.config, "break_policy", []) or []
+                if not _bp_pol:
+                    continue
+                for _rule in _bp_pol:
+                    _bp_diag_rows.append({
+                        "Route": _bcode,
+                        "Node": _rule.get("break_node", ""),
+                        "Action": _rule.get("action", ""),
+                        "Peak Only": "Yes" if _rule.get("peak_only") else "No",
+                    })
+                # Check O6 status for this route
+                _comp = _cc_for_bp(_bp_rr.config, _bp_rr.buses,
+                                    headway_df=_bp_rr.headway_df)
+                _o6 = next((r for r in _comp if r["rule"].startswith("O6:")), None)
+                if _o6 and _o6["status"] == "FAIL":
+                    _o6_violations.extend(
+                        f"{_bcode}: {v}" for v in _o6.get("violations", [])[:2]
+                    )
+        except Exception as _bp_err:
+            st.caption(f"Break Policy diag unavailable: {_bp_err}")
+
+        if _bp_diag_rows or _o6_violations:
+            st.markdown('<div class="section-title">Break Policy Status</div>',
+                        unsafe_allow_html=True)
+            _bp_col1, _bp_col2 = st.columns([1, 1])
+            with _bp_col1:
+                if _bp_diag_rows:
+                    st.caption(f"Active rules across {len(set(r['Route'] for r in _bp_diag_rows))} route(s):")
+                    st.dataframe(pd.DataFrame(_bp_diag_rows),
+                                 hide_index=True, use_container_width=True)
+                else:
+                    st.caption("No Break_Policy rules active anywhere.")
+            with _bp_col2:
+                if _o6_violations:
+                    st.error(
+                        f"**Continuous-driving violations:** {len(_o6_violations)} bus(es) "
+                        f"exceeded the legal limit. Sample:"
+                    )
+                    for v in _o6_violations[:5]:
+                        st.markdown(f"- {v}")
+                else:
+                    st.success("No continuous-driving violations across any route.")
+
+        # ── F5: Auto-Patch Recommendations panel ────────────────────────────
+        try:
+            from src.auto_patch import (
+                generate_patches as _gen_patches,
+                apply_patch as _apply_patch,
+            )
+            _patches = _gen_patches(cs)
+
+            with st.expander(
+                f"Recommended Config Patches ({len(_patches)})",
+                expanded=False,
+            ):
+                if not _patches:
+                    st.success("No config patches recommended — current setup is clean.")
+                else:
+                    st.caption(
+                        "Auto-generated config change suggestions based on diagnostics. "
+                        "Patches are advisory until you click Apply. Original Excel "
+                        "files are unchanged — use the Phase D bulk download in the "
+                        "Config tab to preserve originals."
+                    )
+
+                    # Render the patch table
+                    from src.auto_patch import patches_to_dataframe as _ptd
+                    _patch_df = _ptd(_patches)
+                    st.dataframe(_patch_df, hide_index=True, use_container_width=True,
+                        column_config={
+                            "Severity": st.column_config.TextColumn(width="small"),
+                            "Confidence": st.column_config.TextColumn(width="small"),
+                            "Auto-applicable?": st.column_config.TextColumn(width="small"),
+                        })
+
+                    # Per-patch details
+                    for _p in _patches:
+                        _pc = "#dc2626" if _p.severity == "critical" else                               "#d97706" if _p.severity == "high" else                               "#0d9488" if _p.severity == "medium" else "#475569"
+                        st.markdown(
+                            f'<div style="border-left:3px solid {_pc}; padding:8px 12px; '
+                            f'margin:6px 0; background:#fafafa;">'
+                            f'<div style="font-weight:600; font-size:0.9rem;">'
+                            f'{_p.route_code or "All"} &nbsp;·&nbsp; '
+                            f'<code>{_p.field}</code>: <code>{_p.old_value}</code> '
+                            f'&rarr; <code>{_p.new_value}</code></div>'
+                            f'<div style="font-size:0.8rem; color:#475569; '
+                            f'margin-top:4px;"><b>Why:</b> {_p.reason}</div>'
+                            f'<div style="font-size:0.8rem; color:#475569; '
+                            f'margin-top:2px;"><b>Expected benefit:</b> '
+                            f'{_p.expected_benefit}</div>'
+                            f'{"<div style=\"font-size:0.78rem; color:#dc2626; margin-top:4px;\"><b>Safety note:</b> " + _p.safety_notes + "</div>" if _p.safety_notes else ""}'
+                            f'</div>', unsafe_allow_html=True,
+                        )
+
+                    st.markdown(" ")
+
+                    # Bulk-apply controls
+                    _safe_patches = [p for p in _patches if p.safe_to_auto_apply]
+                    _unsafe_patches = [p for p in _patches if not p.safe_to_auto_apply]
+                    _ap_col1, _ap_col2, _ap_col3 = st.columns([2, 2, 3])
+
+                    with _ap_col1:
+                        if st.button(
+                            f"Apply all {len(_safe_patches)} safe patches",
+                            type="primary",
+                            disabled=(len(_safe_patches) == 0),
+                            key="apply_all_safe_patches",
+                        ):
+                            _applied: list[str] = []
+                            _failed: list[str] = []
+                            for _p in _safe_patches:
+                                _ok, _msg = _apply_patch(_p, city_cfg)
+                                (_applied if _ok else _failed).append(_msg)
+                            with st.spinner("Re-running citywide schedule..."):
+                                try:
+                                    _new_result = schedule_city(
+                                        city_cfg,
+                                        mode=st.session_state.get("city_mode_used", "planning")
+                                    )
+                                    st.session_state["city_result"] = _new_result
+                                    st.session_state["city_config"] = city_cfg
+                                    st.success(
+                                        f"Applied {len(_applied)} patch(es). "
+                                        f"{len(_failed)} failed."
+                                    )
+                                    if _applied:
+                                        with st.expander("Apply log", expanded=False):
+                                            for m in _applied:
+                                                st.markdown(f"- {m}")
+                                    if _failed:
+                                        with st.expander("Failures", expanded=True):
+                                            for m in _failed:
+                                                st.markdown(f"- {m}")
+                                    st.rerun()
+                                except Exception as _re_err:
+                                    st.error(f"Re-run failed: {_re_err}")
+
+                    with _ap_col2:
+                        # Per-patch selector for individual apply
+                        _safe_ids = [p.patch_id for p in _safe_patches]
+                        _picked = st.selectbox(
+                            "Apply individual patch",
+                            options=["—"] + _safe_ids,
+                            key="patch_indiv_select",
+                            label_visibility="collapsed",
+                        )
+                        if _picked and _picked != "—":
+                            if st.button("Apply this patch", key="apply_one_patch"):
+                                _p = next((p for p in _patches if p.patch_id == _picked), None)
+                                if _p is None:
+                                    st.error(f"Patch {_picked} not found")
+                                else:
+                                    _ok, _msg = _apply_patch(_p, city_cfg)
+                                    if _ok:
+                                        with st.spinner("Re-running..."):
+                                            try:
+                                                _new_result = schedule_city(
+                                                    city_cfg,
+                                                    mode=st.session_state.get("city_mode_used", "planning")
+                                                )
+                                                st.session_state["city_result"] = _new_result
+                                                st.session_state["city_config"] = city_cfg
+                                                st.success(_msg)
+                                                st.rerun()
+                                            except Exception as _re_err:
+                                                st.error(f"Re-run failed: {_re_err}")
+                                    else:
+                                        st.error(_msg)
+
+                    with _ap_col3:
+                        if _unsafe_patches:
+                            st.caption(
+                                f"{len(_unsafe_patches)} advisory-only patch(es) — "
+                                f"cannot be auto-applied. Resolve manually using the "
+                                f"safety notes shown above."
+                            )
+
+        except ImportError:
+            st.caption("Auto-patch module unavailable.")
+        except Exception as _ap_err:
+            st.warning(f"Auto-patch panel: {_ap_err}")
+
+
+
         # Min feasible headway table
         _city_mode_used = st.session_state.get("city_mode_used", "planning")
         _mf_display   = []
