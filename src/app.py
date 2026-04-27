@@ -1738,7 +1738,7 @@ with st.sidebar:
             disabled=not uploaded_files,
         )
         st.divider()
-        st.caption("Planning-Compliant · Resource Optimization · Service Maximization")
+        st.caption("Planning Compliant · Resource Optimization · Service Maximization")
 
 
 # ── Main ──────────────────────────────────────────────────────────────────────
