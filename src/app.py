@@ -3903,6 +3903,28 @@ elif app_mode == "Citywide":
             _avail_modes = [m for m in ("planning", "efficiency", "service_max")
                             if m in _scenario_results]
 
+    # ── CITY TAB 6: Compare Modes ─────────────────────────────────────────────
+    with tab_compare:
+        _scenario_results = st.session_state.get("scenario_results", {})
+        _mode_labels = {
+            "planning":  "Planning",
+            "efficiency": "Efficiency",
+            "service_max": "Service Max",
+        }
+
+        if len(_scenario_results) < 2:
+            st.info(
+                "Run **at least 2 different scheduling modes** to unlock the comparison. "
+                "Currently stored: " +
+                (", ".join(_mode_labels.get(m, m) for m in _scenario_results)
+                 if _scenario_results else "none") +
+                ". \n\n"
+                "Switch mode in the sidebar and click **▶ Generate Citywide Schedule** again."
+            )
+        else:
+            _avail_modes = [m for m in ("planning", "efficiency", "service_max")
+                            if m in _scenario_results]
+
             # ── 1. Citywide Summary Table ─────────────────────────────────────
             st.markdown('<div class="section-title">Citywide Summary</div>',
                         unsafe_allow_html=True)
@@ -3929,9 +3951,6 @@ elif app_mode == "Citywide":
             _sum_rows = [_scen_row(m, _scenario_results[m]) for m in _avail_modes]
             _sum_df  = pd.DataFrame(_sum_rows)
 
-            # Highlight best value per metric
-            _numeric_cols = ["Fleet Used", "Revenue Trips", "Max Waiting (min)",
-                             "HW Infeasible Routes"]
             st.dataframe(_sum_df, hide_index=True, use_container_width=True,
                          column_config={
                              "Mode": st.column_config.TextColumn(width="medium"),
@@ -4003,7 +4022,7 @@ elif app_mode == "Citywide":
                     )
                     st.plotly_chart(_fig_sc2, use_container_width=True)
 
-                # Radar / spider chart for normalised multi-metric comparison
+                # Additional visualizations
                 _col_c, _col_d = st.columns(2)
                 with _col_c:
                     # Utilization + on-time + dead-KM bar cluster
@@ -4100,16 +4119,10 @@ elif app_mode == "Citywide":
                 _p = _scenario_results["planning"]
                 _e = _scenario_results["efficiency"]
                 _fleet_saving = _p.total_buses_used - _e.total_buses_used
-                _gap_diff   = _e.max_headway_gap_min - _p.max_headway_gap_min
                 if _fleet_saving > 0:
                     _recs.append(
                         f"**Efficiency mode saves {_fleet_saving} bus(es)** vs Planning "
                         f"({_e.total_buses_used} vs {_p.total_buses_used} fleet)."
-                    )
-                if _gap_diff > 15:
-                    _recs.append(
-                        f"**Planning mode gives better service** — max waiting time is "
-                        f"{_gap_diff:.0f} min shorter than Efficiency."
                     )
             if "service_max" in _scenario_results:
                 _sm = _scenario_results["service_max"]
