@@ -232,8 +232,15 @@ def _effective_break(config, current_time: datetime, base_break: int,
     if _is_off_peak(current_time):
         extra = getattr(config, 'off_peak_layover_extra_min', 0)
         max_b = getattr(config, 'max_layover_min', MAX_BREAK)
-        return min(base_break + extra, max_b)
-    return base_break
+        result = min(base_break + extra, max_b)
+    else:
+        result = base_break
+    
+    # ── GLOBAL MAX_LAYOVER_MIN CAP (applies to ALL breaks) ──────────────────
+    max_break = getattr(config, 'max_layover_min', MAX_BREAK)
+    if result > max_break:
+        result = max_break
+    return result
 
 def _operational_nodes(config):
     nodes = [config.start_point, config.end_point]
@@ -341,6 +348,15 @@ def _ready_time(bus, min_break, config=None):
         effective = (_effective_break(config, bus.current_time, min_break,
                                        current_location=bus.current_location)
                      if config is not None else min_break)
+        
+        # ── MAX_LAYOVER_MIN CAP ──────────────────────────────────────────────
+        # Enforce max_layover_min: no break can exceed the configured maximum
+        if config is not None:
+            max_break = getattr(config, 'max_layover_min', MAX_BREAK)
+            if effective > max_break:
+                effective = max_break
+        # ─────────────────────────────────────────────────────────────────────
+        
         return bus.current_time + timedelta(minutes=effective)
     return bus.current_time
 
@@ -626,6 +642,7 @@ def _select_bus(buses, trip, config, min_break, natural_gap=None):
 
 def _balance_breaks(buses, config):
     min_break = config.preferred_layover_min
+    max_break = getattr(config, 'max_layover_min', MAX_BREAK)
     for bus in buses:
         rev_idx = [i for i, t in enumerate(bus.trips) if t.trip_type == "Revenue"]
         for j in range(1, len(rev_idx)):
@@ -635,7 +652,17 @@ def _balance_breaks(buses, config):
             tp, tc = bus.trips[i_prev], bus.trips[i_curr]
             if not (tp.actual_arrival and tc.actual_departure): continue
             gap = (tc.actual_departure - tp.actual_arrival).total_seconds() / 60
-            if gap < min_break:
+            
+            # ── CAP BREAKS THAT EXCEED MAX_LAYOVER_MIN ───────────────────────
+            if gap > max_break:
+                # Reduce the later departure to bring gap down to max_break
+                new_dep = tp.actual_arrival + timedelta(minutes=max_break)
+                delta = tc.actual_departure - new_dep
+                if delta.total_seconds() > 0:
+                    tc.actual_departure = new_dep
+                    tc.actual_arrival = tc.actual_departure + timedelta(minutes=tc.travel_time_min)
+            # ─────────────────────────────────────────────────────────────────
+            elif gap < min_break:
                 delta = timedelta(minutes=min(min_break - gap,
                                               float(config.max_headway_deviation_min)))
                 if delta.total_seconds() > 0:
