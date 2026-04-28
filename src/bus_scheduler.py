@@ -184,21 +184,10 @@ def _effective_break(config, current_time: datetime, base_break: int,
 
     Resolution order (first match wins):
       1. Phase F: Break_Policy Action="Add" at this location
-         -> force max(regulatory_break_min, base_break) so the driver
-         gets a full reset break here.
       2. Phase C: Break_Policy Action="Remove" at this location
-         -> return FAST_TURNAROUND_MIN (2 min) instead of the full break.
-      3. Off-peak (11:00-15:00): extend by off_peak_layover_extra_min,
-         capped at max_layover_min.
-      4. Default: return base_break unchanged.
-
-    Both 1 and 2 honor the rule's Peak_Only flag.
-
-    Note: Add takes priority over Remove. If the same node has both
-    rules (an unusual config), Add wins because labor-law compliance
-    is more important than terminal congestion. This is also why
-    auto_patch._gen_continuous_driving_patches flags Remove conflicts
-    instead of silently overriding them.
+      3. Phase G: Break_Policy Action="Cap" at this location (NEW)
+      4. Off-peak (11:00-15:00): extend by off_peak_layover_extra_min
+      5. Default: return base_break unchanged
     """
     # ── Phase F: Action=Add — force regulatory break ─────────────────────
     if current_location is not None:
@@ -212,9 +201,6 @@ def _effective_break(config, current_time: datetime, base_break: int,
                 continue
             if rule.get("peak_only") and not _is_peak(current_time):
                 continue
-            # Match — force regulatory-length break, capped at max_layover.
-            # base_break is preserved as the floor so Add never SHORTENS
-            # an existing long break.
             return min(max(reg_brk, base_break), max_b)
 
     # ── Phase C: Action=Remove — fast turnaround ─────────────────────────
@@ -229,12 +215,34 @@ def _effective_break(config, current_time: datetime, base_break: int,
                 continue
             return FAST_TURNAROUND_MIN
 
+    # ── NEW: Phase G: Action=Cap — per-location max hold ─────────────────
+    if current_location is not None:
+        policy = getattr(config, "break_policy", None) or []
+        for rule in policy:
+            if (rule.get("action") or "").lower() != "cap":
+                continue
+            if rule.get("break_node") != current_location:
+                continue
+            if rule.get("peak_only") and not _is_peak(current_time):
+                continue
+            max_cap = rule.get("max_hold_min", 20)
+            if base_break > max_cap:
+                base_break = max_cap
+            break  # Only apply first matching cap rule
+
+    # ── Off-peak extension (applies after Cap) ───────────────────────────
     if _is_off_peak(current_time):
         extra = getattr(config, 'off_peak_layover_extra_min', 0)
         max_b = getattr(config, 'max_layover_min', MAX_BREAK)
         result = min(base_break + extra, max_b)
     else:
         result = base_break
+    
+    # ── Global max_layover_min cap (always applied) ──────────────────────
+    max_break = getattr(config, 'max_layover_min', MAX_BREAK)
+    if result > max_break:
+        result = max_break
+    return result
     
     # ── GLOBAL MAX_LAYOVER_MIN CAP (applies to ALL breaks) ──────────────────
     max_break = getattr(config, 'max_layover_min', MAX_BREAK)
