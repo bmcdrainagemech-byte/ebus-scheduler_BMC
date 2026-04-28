@@ -380,6 +380,15 @@ def _ready_time(bus, min_break, config=None):
                                        current_location=bus.current_location)
                      if config is not None else min_break)
         
+        # Enforce max_layover_min cap
+        if config is not None:
+            max_break = getattr(config, 'max_layover_min', MAX_BREAK)
+            if effective > max_break:
+                effective = max_break
+        
+        return bus.current_time + timedelta(minutes=effective)
+    return bus.current_time
+        
         # ── NEW: Enforce max_layover_min cap ─────────────────────────────
         # Prevents any break from exceeding the configured maximum.
         # This caps the idle time at terminals even when natural gaps
@@ -690,8 +699,23 @@ def _balance_breaks(buses, config):
             if any(t.trip_type == "Charging" for t in bus.trips[i_prev+1:i_curr]):
                 continue
             tp, tc = bus.trips[i_prev], bus.trips[i_curr]
-            if not (tp.actual_arrival and tc.actual_departure): continue
+            if not (tp.actual_arrival and tc.actual_departure): 
+                continue
             gap = (tc.actual_departure - tp.actual_arrival).total_seconds() / 60
+            
+            # Cap breaks that exceed max_layover_min
+            if gap > max_break:
+                new_dep = tp.actual_arrival + timedelta(minutes=max_break)
+                delta = tc.actual_departure - new_dep
+                if delta.total_seconds() > 0:
+                    tc.actual_departure = new_dep
+                    tc.actual_arrival = tc.actual_departure + timedelta(minutes=tc.travel_time_min)
+            elif gap < min_break:
+                delta = timedelta(minutes=min(min_break - gap,
+                                              float(config.max_headway_deviation_min)))
+                if delta.total_seconds() > 0:
+                    tc.actual_departure += delta
+                    tc.actual_arrival = tc.actual_departure + timedelta(minutes=tc.travel_time_min)
             
             # ── NEW: Cap breaks that exceed max_layover_min ──────────────
             if gap > max_break:
