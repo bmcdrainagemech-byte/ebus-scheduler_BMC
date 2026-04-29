@@ -12,7 +12,7 @@ P6: _check_p6 scans all buses' most-recent same-direction revenue trip (not
     just trips[-1]), and re-checks after each bump until gap >= SAME_DIR_GAP.
 """
 from __future__ import annotations
-__version__ = "2026-04-29-b7"  # auto-stamped - Hardcoded GANGAJALIYA cap
+__version__ = "2026-04-29-b9"  # Hardcoded GANGAJALIYA 5-min cap
 from datetime import datetime, timedelta
 from src.models import Trip, BusState, RouteConfig, ScheduleInfeasibleError
 
@@ -25,12 +25,9 @@ EVENING_PEAK_START = REF_DATE.replace(hour=15, minute=0)
 EVENING_PEAK_END   = REF_DATE.replace(hour=20, minute=0)
 
 # P5 charging window: 11:00–16:00 with ±45 min flex per bus.
-# Buses are distributed evenly across the window so bus 0 targets 11:00
-# and bus N-1 targets 16:00, with each bus allowed ±CHARGE_FLEX_MIN around
-# its personal target before the scheduler considers it late for charging.
 CHARGE_WINDOW_START = REF_DATE.replace(hour=11, minute=0)
 CHARGE_WINDOW_END   = REF_DATE.replace(hour=16, minute=0)
-CHARGE_FLEX_MIN     = 45   # ± minutes around each bus's target charge time
+CHARGE_FLEX_MIN     = 45
 
 # Fallback values if config missing
 MAX_BREAK         = 20
@@ -38,8 +35,8 @@ MIDDAY_CHARGE_SOC = 65.0
 SOC_TRIGGER       = 30.0
 SOC_FLOOR         = 20.0
 SAME_DIR_GAP      = 5
-DEPOT_DWELL_MIN   = 35   # fallback minimum charge time (config overrides)
-DEPOT_DWELL_MAX   = 90   # maximum charge time allowed
+DEPOT_DWELL_MIN   = 35
+DEPOT_DWELL_MAX   = 90
 KM_BALANCE_MAX    = 20.0
 FAST_TURNAROUND_MIN = 2
 HEADWAY_WEIGHT    = 2.0
@@ -47,6 +44,12 @@ PLANNING_HW_TOLERANCE = 3
 
 OFF_PEAK_START = REF_DATE.replace(hour=11, minute=0)
 OFF_PEAK_END   = REF_DATE.replace(hour=15, minute=0)
+
+# ── HARDCODED CAP FOR GANGAJALIYA ──────────────────────────────────────────
+# These locations will have EXACTLY 5 minute breaks (no more, no less)
+CAP_LOCATIONS = ["GANGAJALIYA", "GANGAJALIYA "]
+CAP_BREAK_MIN = 5
+# ──────────────────────────────────────────────────────────────────────────
 
 
 # ── Headway band helpers ─────────────────────────────────────────────────────
@@ -102,6 +105,7 @@ def _is_peak(t):
     return (MORNING_PEAK_START <= t < MORNING_PEAK_END or
             EVENING_PEAK_START <= t < EVENING_PEAK_END)
 
+
 def _charge_window(config):
     """Return (window_start, window_end) datetimes from config or hardcoded fallback."""
     try:
@@ -128,6 +132,7 @@ def _target_charge_time(bus, config) -> datetime:
         offset = idx * window_min / (n - 1)
     return cws + timedelta(minutes=offset)
 
+
 def _in_charge_window(bus, config) -> bool:
     """True if this bus should be considered for P5 charging now."""
     target = _target_charge_time(bus, config)
@@ -143,7 +148,6 @@ def _in_charge_window(bus, config) -> bool:
 def _apply_break_policy_cap(config, location, current_hold_min, current_time):
     """
     Apply Break_Policy "Cap" action to limit hold times at specific locations.
-    Returns the capped break minutes.
     """
     policy = getattr(config, "break_policy", None) or []
     for rule in policy:
@@ -165,12 +169,18 @@ def _effective_break(config, current_time: datetime, base_break: int,
     Return break minutes before the next revenue trip.
 
     Resolution order (first match wins):
-      1. Action="Add" → force regulatory break
-      2. Action="Remove" → fast turnaround (2 min)
-      3. Action="Cap" → per-location max hold
-      4. Off-peak extension
-      5. Default base_break
+      1. HARDCODE: GANGAJALIYA → 5 min
+      2. Action="Add" → force regulatory break
+      3. Action="Remove" → fast turnaround (2 min)
+      4. Action="Cap" → per-location max hold
+      5. Off-peak extension
+      6. Default base_break
     """
+    # ── HARDCODE: Force 5-minute break at GANGAJALIYA ───────────────────────
+    if current_location and current_location in CAP_LOCATIONS:
+        return CAP_BREAK_MIN
+    # ─────────────────────────────────────────────────────────────────────────
+
     # ── Phase F: Action=Add — force regulatory break ─────────────────────
     if current_location is not None:
         policy = getattr(config, "break_policy", None) or []
@@ -297,20 +307,14 @@ def _fleet_avg_km(buses):
 def _ready_time(bus, min_break, config=None):
     """
     Departure-ready time for the bus.
-    After Revenue: adds min_break (extended during off-peak if config provided,
-                   shortened to FAST_TURNAROUND_MIN if a Break_Policy
-                   Remove rule applies at the bus's current location).
-    After Dead/Charging/Shuttle: immediate.
     
     HARDCODE: Forces 5-minute break at GANGAJALIYA regardless of other rules.
     """
-    # ── HARDCODE FIX: Force 5-minute break at GANGAJALIYA ───────────────────
-    # This overrides ALL other break logic for GANGAJALIYA
-    if bus.current_location == "GANGAJALIYA":
+    # ── HARDCODE: Force 5-minute break at GANGAJALIYA ───────────────────────
+    if bus.current_location and bus.current_location in CAP_LOCATIONS:
         last = bus.trips[-1] if bus.trips else None
         if last and last.trip_type == "Revenue":
-            # Force exactly 5 minute break at GANGAJALIYA
-            return bus.current_time + timedelta(minutes=5)
+            return bus.current_time + timedelta(minutes=CAP_BREAK_MIN)
     # ─────────────────────────────────────────────────────────────────────────
     
     last = bus.trips[-1] if bus.trips else None
@@ -437,29 +441,22 @@ def _charging_detour(bus, config, resume_by, min_break):
     if bus.current_location != config.depot: return inserted
     _, _, from_tt = _nearest_node_from_depot(config)
     
-    # Calculate time needed to reach target SOC
     soc_needed = max(10, config.target_soc_percent - bus.soc_percent)
     time_to_target = (soc_needed / 100 * config.battery_kwh / config.depot_flow_rate_kw) * 60
     
-    # Get minimum charge duration from config (respect user setting!)
     min_charge = getattr(config, 'min_charge_duration_min', DEPOT_DWELL_MIN)
-    
-    # Calculate maximum available time before service ends
     max_charge = (resume_by - bus.current_time).total_seconds() / 60 - from_tt - min_break
     
-    # Determine final charge time: at least min_charge, at most DEPOT_DWELL_MAX
     charge_time = max(min_charge, min(time_to_target, DEPOT_DWELL_MAX))
     
-    # If not enough time for minimum charge, try shorter emergency charge
     if max_charge < min_charge:
         if max_charge >= min_charge - 10:
             charge_time = max_charge
         else:
             return inserted
     
-    # Cap at available time
     charge_time = min(charge_time, max(min_charge - 10, max_charge))
-    charge_time = max(min_charge - 10, charge_time)  # ensure not too short
+    charge_time = max(min_charge - 10, charge_time)
     
     ct = Trip(direction="DEPOT", trip_type="Charging",
               start_location=config.depot, end_location=config.depot,
@@ -542,38 +539,33 @@ def _find_and_reposition(buses, trip, config, min_break):
 
 
 def _balance_breaks(buses, config):
-    """Enforce min/max break constraints after scheduling."""
+    """
+    Enforce min/max break constraints after scheduling.
     
-    # ── HARDCODE FIX: Force 5-minute breaks at GANGAJALIYA ───────────────────
-    # This ensures that even after scheduling, breaks at GANGAJALIYA are capped
-    for bus in buses:
-        for i, trip in enumerate(bus.trips):
-            if trip.trip_type == "Revenue" and trip.end_location == "GANGAJALIYA":
-                # Find next departure from GANGAJALIYA
-                for j in range(i+1, len(bus.trips)):
-                    next_trip = bus.trips[j]
-                    if next_trip.trip_type == "Revenue" and next_trip.start_location == "GANGAJALIYA":
-                        # Force 5 minute gap
-                        new_departure = trip.actual_arrival + timedelta(minutes=5)
-                        if next_trip.actual_departure != new_departure:
-                            next_trip.actual_departure = new_departure
-                            next_trip.actual_arrival = new_departure + timedelta(minutes=next_trip.travel_time_min)
-                        break
-    # ─────────────────────────────────────────────────────────────────────────
-    
+    IMPORTANT: Skips balance for GANGAJALIYA to preserve the hardcoded cap.
+    """
     min_break = config.preferred_layover_min
     max_break = getattr(config, 'max_layover_min', MAX_BREAK)
+    
     for bus in buses:
         rev_idx = [i for i, t in enumerate(bus.trips) if t.trip_type == "Revenue"]
         for j in range(1, len(rev_idx)):
             i_prev, i_curr = rev_idx[j-1], rev_idx[j]
-            if any(t.trip_type == "Charging" for t in bus.trips[i_prev+1:i_curr]):
+            
+            if any(t.trip_type in ("Charging", "Dead", "Shuttle") for t in bus.trips[i_prev+1:i_curr]):
                 continue
+                
             tp, tc = bus.trips[i_prev], bus.trips[i_curr]
-            if not (tp.actual_arrival and tc.actual_departure): continue
+            if not (tp.actual_arrival and tc.actual_departure): 
+                continue
+            
+            # ── SKIP BALANCE FOR CAPPED LOCATIONS ────────────────────────────────
+            if tp.end_location and tp.end_location in CAP_LOCATIONS:
+                continue  # Preserve the hardcoded cap value
+            # ─────────────────────────────────────────────────────────────────
+                
             gap = (tc.actual_departure - tp.actual_arrival).total_seconds() / 60
             
-            # Cap breaks that exceed max_layover_min
             if gap > max_break:
                 new_dep = tp.actual_arrival + timedelta(minutes=max_break)
                 delta = tc.actual_departure - new_dep
@@ -1313,7 +1305,7 @@ def check_compliance(config: RouteConfig, buses: list[BusState],
                     "details": f"{len(p6_v)} violations" if p6_v else "All gaps >= 5 min",
                     "violations": p6_v[:10]})
 
-    # O1-O4 (simplified)
+    # O1
     results.append({"rule": "O1: Peak headways tighter than off-peak", "priority": 7,
                     "status": "PASS", "details": "Verify in headway chart", "violations": []})
 
