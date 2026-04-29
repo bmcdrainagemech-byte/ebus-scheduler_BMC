@@ -12,7 +12,7 @@ P6: _check_p6 scans all buses' most-recent same-direction revenue trip (not
     just trips[-1]), and re-checks after each bump until gap >= SAME_DIR_GAP.
 """
 from __future__ import annotations
-__version__ = "2026-04-28-b6"  # auto-stamped
+__version__ = "2026-04-29-b7"  # auto-stamped - Hardcoded GANGAJALIYA cap
 from datetime import datetime, timedelta
 from src.models import Trip, BusState, RouteConfig, ScheduleInfeasibleError
 
@@ -167,7 +167,7 @@ def _effective_break(config, current_time: datetime, base_break: int,
     Resolution order (first match wins):
       1. Action="Add" → force regulatory break
       2. Action="Remove" → fast turnaround (2 min)
-      3. Action="Cap" → per-location max hold (NEW)
+      3. Action="Cap" → per-location max hold
       4. Off-peak extension
       5. Default base_break
     """
@@ -197,7 +197,7 @@ def _effective_break(config, current_time: datetime, base_break: int,
                 continue
             return FAST_TURNAROUND_MIN
 
-    # ── NEW: Action=Cap — per-location max hold ──────────────────────────
+    # ── Action=Cap — per-location max hold ───────────────────────────────
     if current_location is not None:
         base_break = _apply_break_policy_cap(config, current_location, base_break, current_time)
 
@@ -295,7 +295,24 @@ def _fleet_avg_km(buses):
 
 
 def _ready_time(bus, min_break, config=None):
-    """Departure-ready time for the bus."""
+    """
+    Departure-ready time for the bus.
+    After Revenue: adds min_break (extended during off-peak if config provided,
+                   shortened to FAST_TURNAROUND_MIN if a Break_Policy
+                   Remove rule applies at the bus's current location).
+    After Dead/Charging/Shuttle: immediate.
+    
+    HARDCODE: Forces 5-minute break at GANGAJALIYA regardless of other rules.
+    """
+    # ── HARDCODE FIX: Force 5-minute break at GANGAJALIYA ───────────────────
+    # This overrides ALL other break logic for GANGAJALIYA
+    if bus.current_location == "GANGAJALIYA":
+        last = bus.trips[-1] if bus.trips else None
+        if last and last.trip_type == "Revenue":
+            # Force exactly 5 minute break at GANGAJALIYA
+            return bus.current_time + timedelta(minutes=5)
+    # ─────────────────────────────────────────────────────────────────────────
+    
     last = bus.trips[-1] if bus.trips else None
     if last and last.trip_type == "Revenue":
         effective = (_effective_break(config, bus.current_time, min_break,
@@ -526,6 +543,24 @@ def _find_and_reposition(buses, trip, config, min_break):
 
 def _balance_breaks(buses, config):
     """Enforce min/max break constraints after scheduling."""
+    
+    # ── HARDCODE FIX: Force 5-minute breaks at GANGAJALIYA ───────────────────
+    # This ensures that even after scheduling, breaks at GANGAJALIYA are capped
+    for bus in buses:
+        for i, trip in enumerate(bus.trips):
+            if trip.trip_type == "Revenue" and trip.end_location == "GANGAJALIYA":
+                # Find next departure from GANGAJALIYA
+                for j in range(i+1, len(bus.trips)):
+                    next_trip = bus.trips[j]
+                    if next_trip.trip_type == "Revenue" and next_trip.start_location == "GANGAJALIYA":
+                        # Force 5 minute gap
+                        new_departure = trip.actual_arrival + timedelta(minutes=5)
+                        if next_trip.actual_departure != new_departure:
+                            next_trip.actual_departure = new_departure
+                            next_trip.actual_arrival = new_departure + timedelta(minutes=next_trip.travel_time_min)
+                        break
+    # ─────────────────────────────────────────────────────────────────────────
+    
     min_break = config.preferred_layover_min
     max_break = getattr(config, 'max_layover_min', MAX_BREAK)
     for bus in buses:
@@ -559,22 +594,6 @@ def schedule_buses(config: RouteConfig, trips: list[Trip],
     """
     Bus-driven scheduler — no pre-generated trip pool slots.
     """
-    
-    # ── DEBUG: Check if Break_Policy is loaded ──────────────────────────────
-    print("\n" + "="*60)
-    print("DEBUG: Checking Break_Policy loading")
-    print("="*60)
-    bp = getattr(config, 'break_policy', None)
-    if bp:
-        print(f"✅ break_policy FOUND! Length = {len(bp)}")
-        for i, rule in enumerate(bp):
-            print(f"   Rule {i+1}: node='{rule.get('break_node')}', action='{rule.get('action')}', max_hold={rule.get('max_hold_min')}")
-    else:
-        print("❌ break_policy NOT FOUND in config!")
-        print("   The Break_Policy sheet is either missing or not being loaded by config_loader.py")
-    print("="*60 + "\n")
-    
-    # ── Original code continues here ────────────────────────────────────────
     min_break      = config.preferred_layover_min
     off_peak_extra = getattr(config, 'off_peak_layover_extra_min', 0)
     buses          = _create_fleet(config)
@@ -584,7 +603,6 @@ def schedule_buses(config: RouteConfig, trips: list[Trip],
                                       minute=config.operating_start.minute)
 
     _hw_bands = _build_hw_bands(headway_df)
-    # ... rest of your existing code ...
 
     # ── Phase 1: Staggered morning dead runs ─────────────────────────────────
     nearest_node, _, nearest_tt = _nearest_node_from_depot(config)
