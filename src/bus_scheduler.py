@@ -559,6 +559,22 @@ def schedule_buses(config: RouteConfig, trips: list[Trip],
     """
     Bus-driven scheduler — no pre-generated trip pool slots.
     """
+    
+    # ── DEBUG: Check if Break_Policy is loaded ──────────────────────────────
+    print("\n" + "="*60)
+    print("DEBUG: Checking Break_Policy loading")
+    print("="*60)
+    bp = getattr(config, 'break_policy', None)
+    if bp:
+        print(f"✅ break_policy FOUND! Length = {len(bp)}")
+        for i, rule in enumerate(bp):
+            print(f"   Rule {i+1}: node='{rule.get('break_node')}', action='{rule.get('action')}', max_hold={rule.get('max_hold_min')}")
+    else:
+        print("❌ break_policy NOT FOUND in config!")
+        print("   The Break_Policy sheet is either missing or not being loaded by config_loader.py")
+    print("="*60 + "\n")
+    
+    # ── Original code continues here ────────────────────────────────────────
     min_break      = config.preferred_layover_min
     off_peak_extra = getattr(config, 'off_peak_layover_extra_min', 0)
     buses          = _create_fleet(config)
@@ -568,6 +584,7 @@ def schedule_buses(config: RouteConfig, trips: list[Trip],
                                       minute=config.operating_start.minute)
 
     _hw_bands = _build_hw_bands(headway_df)
+    # ... rest of your existing code ...
 
     # ── Phase 1: Staggered morning dead runs ─────────────────────────────────
     nearest_node, _, nearest_tt = _nearest_node_from_depot(config)
